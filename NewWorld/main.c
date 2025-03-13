@@ -283,7 +283,7 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 				DbgPrint("[*] PTE PAT-Index -> PAT: %d | PCD: %d | PWT: %d -> Index: %llx | IA32_PAT_MSR: 0x%llx\n",
 					PTERaw->PageAccessType, PTERaw->PageCacheDisable, PTERaw->PageWriteThrough,
 					PTERaw->PageAccessType + PTERaw->PageCacheDisable + PTERaw->PageWriteThrough, IA32_PAT_MSR);
-				DbgPrint("[+] PHYS 1GB-\n"
+				DbgPrint("[+] PHYS 4KB-\n"
 					"\t[*] Offset: %llx\n"
 					"\t[*] PageNumber: %llx\n"
 					"\t[*] Value: %llx\n",
