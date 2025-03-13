@@ -1,7 +1,6 @@
 #include <ntifs.h> // new
 #include <intrin.h>
 #include "main.h"
-#include "FuncDefs.h"
 
 // =================================================================
 // GLOBAL DATA
