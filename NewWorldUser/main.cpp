@@ -33,34 +33,6 @@ typedef struct _SYMBOL {
 	LIST_ENTRY ListEntry;
 } SYMBOL, * PSYMBOL;
 
-void HexDump(void* pMemory, size_t size) {
-	unsigned char* p = (unsigned char*)pMemory;
-
-	for (size_t i = 0; i < size; i += 16) {  // Process 16 bytes per line
-		printf("%08X  ", (unsigned int)i);   // Print offset
-
-		// Print hex bytes
-		for (size_t j = 0; j < 16; j++) {
-			if (i + j < size)
-				printf("%02X ", p[i + j]);
-			else
-				printf("   ");  // Padding for alignment
-		}
-
-		printf(" | ");  // Separator
-
-		// Print ASCII representation
-		for (size_t j = 0; j < 16; j++) {
-			if (i + j < size) {
-				unsigned char c = p[i + j];
-				printf("%c", (c >= 32 && c <= 126) ? c : '.');  // Printable ASCII or dot
-			}
-		}
-
-		printf(" |\n");
-	}
-}
-
 typedef struct PE_relocation_t {
 	DWORD RVA;
 	WORD Type : 4;
@@ -374,12 +346,15 @@ symbol_ctx* LoadSymbolsFromPE(PE* pe) {
 	else {
 		//TODO : check if exisiting PDB corresponds to the file version
 	}
-	DWORD64 asked_pdb_base_addr = 0x1337000; // ntos baseAddress from Debugging at pe = ... -> 0x0000000140000000 ; ci base -> 0x00000001c0000000
+	DWORD64 asked_pdb_base_addr = 0x140000000; // ntos baseAddress from Debugging at pe = ... -> 0x0000000140000000 ; ci base -> 0x00000001c0000000
+	//DWORD64 asked_pdb_base_addr = 0x1337000; // ntos baseAddress from Debugging at pe = ... -> 0x0000000140000000 ; ci base -> 0x00000001c0000000
 	//DWORD64 asked_pdb_base_addr = 0x1c0000000; // ntos baseAddress from Debugging at pe = ... -> 0x0000000140000000 ; ci base -> 0x00000001c0000000
 	DWORD pdb_image_size = MAXDWORD;
 	HANDLE cp = GetCurrentProcess();
-	if (!SymInitialize(cp, NULL, FALSE)) {
+	//if (!SymInitialize(cp, NULL, FALSE)) {
+	if (!SymInitializeW(cp, ctx->pdb_name_w, FALSE)) {
 		//if (!SymInitializeW(cp, ctx->pdb_name_w, FALSE)) {
+		printf("Failed SymInitialize\n");
 		free(ctx);
 		return NULL;
 	}
@@ -395,8 +370,10 @@ symbol_ctx* LoadSymbolsFromPE(PE* pe) {
 	while (pdb_base_addr == 0) {
 		DWORD err = GetLastError();
 		if (err == ERROR_SUCCESS)
+			printf("Success\n");
 			break;
 		if (err == ERROR_FILE_NOT_FOUND) {
+			printf("PDB file not found\n");
 			SymUnloadModule(cp, asked_pdb_base_addr);//TODO : fix handle leak
 			SymCleanup(cp);
 			free(ctx);
@@ -407,6 +384,7 @@ symbol_ctx* LoadSymbolsFromPE(PE* pe) {
 		pdb_base_addr = SymLoadModuleExW(cp, NULL, ctx->pdb_name_w, NULL, (DWORD64)pe->baseAddress, pdb_image_size, NULL, 0);
 	}
 	ctx->pdb_base_addr = pdb_base_addr;
+	printf("PDB base address: 0x%llx\n", ctx->pdb_base_addr);
 	return ctx;
 }
 
@@ -425,20 +403,25 @@ DWORD GetFieldOffset(symbol_ctx* ctx, LPCSTR struct_name, LPCWSTR field_name) {
 	si.si.MaxNameLen = sizeof(si.name);
 	BOOL res = SymGetTypeFromName(ctx->sym_handle, ctx->pdb_base_addr, struct_name, &si.si);
 	if (!res) {
+		DWORD err = GetLastError();
+		printf("SymGetTypeFromName failed: sym_handle: 0x%llx, pdb_base_addr: 0x%llx, struct_name: %s, Err: %d\n", ctx->sym_handle, ctx->pdb_base_addr, struct_name, err);
 		return 0;
 	}
 
 	TI_FINDCHILDREN_PARAMS* childrenParam = (TI_FINDCHILDREN_PARAMS*)calloc(1, sizeof(TI_FINDCHILDREN_PARAMS));
 	if (childrenParam == NULL) {
+		printf("calloc failed\n");
 		return 0;
 	}
 
 	res = SymGetTypeInfo(ctx->sym_handle, ctx->pdb_base_addr, si.si.TypeIndex, TI_GET_CHILDRENCOUNT, &childrenParam->Count);
 	if (!res) {
+		printf("SymGetTypeInfo failed\n");
 		return 0;
 	}
 	TI_FINDCHILDREN_PARAMS* ptr = (TI_FINDCHILDREN_PARAMS*)realloc(childrenParam, sizeof(TI_FINDCHILDREN_PARAMS) + childrenParam->Count * sizeof(ULONG));
 	if (ptr == NULL) {
+		printf("realloc failed\n");
 		free(childrenParam);
 		return 0;
 	}
@@ -456,10 +439,46 @@ DWORD GetFieldOffset(symbol_ctx* ctx, LPCSTR struct_name, LPCWSTR field_name) {
 		break;
 	}
 	free(childrenParam);
+	printf("Offset of %S in %s: %d\n", field_name, struct_name, offset);
 	return offset;
 }
-
 void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
+	if (ctx == NULL) {
+		return;
+	}
+
+	if (ctx->sym_handle != NULL && ctx->pdb_base_addr != 0) {
+		// Only unload this specific module
+		if (!SymUnloadModule(ctx->sym_handle, ctx->pdb_base_addr)) {
+			printf("SymUnloadModule failed: %d\n", GetLastError());
+		}
+
+		// Don't call SymCleanup here - it terminates the symbol handler
+		// SymCleanup should only be called when you're completely done with symbols
+	}
+
+	// Delete the PDB file if requested
+	if (delete_pdb && ctx->pdb_name_w != NULL) {
+		DeleteFileW(ctx->pdb_name_w);
+	}
+
+	// Free allocated memory
+	if (ctx->pdb_name_w != NULL) {
+		free(ctx->pdb_name_w);
+		ctx->pdb_name_w = NULL;
+	}
+
+	// Free the context structure itself
+	free(ctx);
+}
+void CleanupSymbolHandler(HANDLE symHandle) {
+	if (symHandle != NULL) {
+		if (!SymCleanup(symHandle)) {
+			printf("SymCleanup failed: %d\n", GetLastError());
+		}
+	}
+}
+/*void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
 	SymUnloadModule(ctx->sym_handle, ctx->pdb_base_addr);
 	SymCleanup(ctx->sym_handle);
 	if (delete_pdb) {
@@ -468,9 +487,34 @@ void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
 	free(ctx->pdb_name_w);
 	ctx->pdb_name_w = NULL;
 	free(ctx);
-}
+}*/
 
 DWORD64 GetSymbolOffset(symbol_ctx* ctx, LPCSTR symbol_name) {
+	SYMBOL_INFO symbolInfo = { 0 };
+	symbolInfo.SizeOfStruct = sizeof(SYMBOL_INFO);
+	symbolInfo.MaxNameLen = MAX_SYM_NAME;
+
+	// Use SymFromName to look up symbols (including functions)
+	if (SymFromName(ctx->sym_handle, symbol_name, &symbolInfo)) {
+		return symbolInfo.Address - ctx->pdb_base_addr;
+	}
+	else {
+		DWORD err = GetLastError();
+		printf("SymFromName failed for '%s': error %d (0x%x)\n", symbol_name, err, err);
+
+		// Try as a type (for backward compatibility)
+		SYMBOL_INFO_PACKAGE si = { 0 };
+		si.si.SizeOfStruct = sizeof(SYMBOL_INFO);
+		si.si.MaxNameLen = sizeof(si.name);
+
+		if (SymGetTypeFromName(ctx->sym_handle, ctx->pdb_base_addr, symbol_name, &si.si)) {
+			return si.si.Address - ctx->pdb_base_addr;
+		}
+
+		return 0;
+	}
+}
+/*DWORD64 GetSymbolOffset(symbol_ctx* ctx, LPCSTR symbol_name) {
 	SYMBOL_INFO_PACKAGE si = { 0 };
 	si.si.SizeOfStruct = sizeof(SYMBOL_INFO);
 	si.si.MaxNameLen = sizeof(si.name);
@@ -479,9 +523,19 @@ DWORD64 GetSymbolOffset(symbol_ctx* ctx, LPCSTR symbol_name) {
 		return si.si.Address - ctx->pdb_base_addr;
 	}
 	else {
+		DWORD err = GetLastError();
+		printf("SymGetTypeFromName failed: sym_handle: 0x%llx, pdb_base_addr: 0x%llx, symbol_name: %s, err: %d\n", ctx->sym_handle, ctx->pdb_base_addr, symbol_name, err);
 		return 0;
 	}
-}
+}*/
+
+typedef struct _INIT {
+	CHAR identifier[4];
+	DWORD NtBaseOffset;
+	DWORD KPROCDirectoryTableBaseOffset;
+	DWORD EPROCActiveProcessLinksOfsset;
+	DWORD EPROCUniqueProcessIdOffset;
+} INIT, * PINIT;
 
 unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD64 offset, BOOLEAN useOffset) {
 	size_t strLen = strlen(str);
@@ -493,7 +547,7 @@ unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD
 		printf("Maximum reached...\n");
 		return 0x0;
 	}
-	PSYMBOL CurrSymbolInArray = (PSYMBOL)SymbolsArray;
+	PSYMBOL CurrSymbolInArray = (PSYMBOL)((PINIT)SymbolsArray + sizeof(INIT));
 
 	if (!useOffset) {
 		offset = GetSymbolOffset(symCtx, str);
@@ -507,6 +561,16 @@ unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD
 	SymbolsArrayIndex++;
 
 	return offset;
+}
+
+BOOL AddInitData(DWORD NtBaseOffset, DWORD KPROCDirectoryTableBaseOffset, DWORD EPROCActiveProcessLinksOfsset, DWORD EPROCUniqueProcessIdOffset) {
+	PINIT Data = (PINIT)SymbolsArray;
+	memcpy(Data[0].identifier, "INIT", 4);
+	Data[0].NtBaseOffset					= NtBaseOffset;
+	Data[0].KPROCDirectoryTableBaseOffset	= KPROCDirectoryTableBaseOffset;
+	Data[0].EPROCActiveProcessLinksOfsset	= EPROCActiveProcessLinksOfsset;
+	Data[0].EPROCUniqueProcessIdOffset		= EPROCUniqueProcessIdOffset;
+	return true;
 }
 
 DWORD64 GetKernelBase(_In_ std::string name) {
@@ -551,20 +615,257 @@ DWORD64 GetKernelBase(_In_ std::string name) {
 	return imageBase;
 }
 
-int main() {
-	LPTSTR ciPath;
-	TCHAR g_ciPath[MAX_PATH] = { 0 };
-	_tcscat_s(g_ciPath, _countof(g_ciPath), TEXT("C:\\Windows\\System32\\ntoskrnl.exe"));
-	ciPath = g_ciPath;
-	symbol_ctx* sym_ctx = LoadSymbolsFromImageFile(ciPath);
+/*void CheckPageStatus(void* address) {
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery(address, &mbi, sizeof(mbi))) {
+		if (mbi.State == MEM_COMMIT && mbi.Protect != PAGE_NOACCESS) {
+			std::cout << "Page is commited in memory." << std::endl;
+		}
+		else {
+			std::cout << "Page is not in memory." << std::endl;
+		}
+	}
+	else {
+		std::cout << "VirtualQuery failed." << std::endl;
+	}
+}*/
+void CheckPageStatus(void* address) {
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery(address, &mbi, sizeof(mbi))) {
+		if (mbi.State == MEM_COMMIT && mbi.Protect != PAGE_NOACCESS) {
+			PSAPI_WORKING_SET_EX_INFORMATION wsInfo = { 0 };
+			wsInfo.VirtualAddress = address;
 
-	if (sym_ctx == NULL) {
-		printf("Symbols not available, download failed, aborting...\n");
-		exit(1);
+			if (QueryWorkingSetEx(GetCurrentProcess(), &wsInfo, sizeof(wsInfo))) {
+				if (wsInfo.VirtualAttributes.Valid) {
+					std::cout << "Page is in memory." << std::endl;
+				}
+				else {
+					std::cout << "Page is swapped out (not in memory)." << std::endl;
+				}
+			}
+			else {
+				std::cout << "QueryWorkingSetEx failed." << std::endl;
+			}
+		}
+		else {
+			std::cout << "Page is not committed." << std::endl;
+		}
+	}
+	else {
+		std::cout << "VirtualQuery failed." << std::endl;
+	}
+}
+
+void HexDump(void* pMemory, size_t size) {
+	unsigned char* p = (unsigned char*)pMemory;
+
+	for (size_t i = 0; i < size; i += 16) {  // Process 16 bytes per line
+		printf("%08X  ", (unsigned int)i);   // Print offset
+
+		// Print hex bytes
+		for (size_t j = 0; j < 16; j++) {
+			if (i + j < size)
+				printf("%02X ", p[i + j]);
+			else
+				printf("   ");  // Padding for alignment
+		}
+
+		printf(" | ");  // Separator
+
+		// Print ASCII representation
+		for (size_t j = 0; j < 16; j++) {
+			if (i + j < size) {
+				unsigned char c = p[i + j];
+				printf("%c", (c >= 32 && c <= 126) ? c : '.');  // Printable ASCII or dot
+			}
+		}
+
+		printf(" |\n");
+	}
+}
+
+// Use this version to safely work with memory manipulated by the driver
+void CheckModifiedMemory(PVOID address, size_t size) {
+	PVOID base = (PVOID)((unsigned long long)address & 0xfffffffffffff000);
+	printf("Checking memory at base: 0x%p\n", base);
+
+	// Just read, don't modify permissions with VirtualProtect
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery(base, &mbi, sizeof(mbi))) {
+		printf("Memory protection: 0x%lx\n", mbi.Protect);
+		printf("Memory state: %s\n",
+			mbi.State == MEM_COMMIT ? "COMMIT" :
+			mbi.State == MEM_RESERVE ? "RESERVE" : "FREE");
 	}
 
-	size_t NumSymbols = 5;
-	SymbolsArrayAllocationSize = NumSymbols * sizeof(SYMBOL);
+	// Read directly from memory without changing permissions
+	__try {
+		printf("Memory content (first 16 bytes):\n");
+		unsigned char* p = (unsigned char*)base;
+
+		for (size_t i = 0; i < size; i += 16) {  // Process 16 bytes per line
+			printf("%08X  ", (unsigned int)i);   // Print offset
+
+			// Print hex bytes
+			for (size_t j = 0; j < 16; j++) {
+				if (i + j < size)
+					printf("%02X ", p[i + j]);
+				else
+					printf("   ");  // Padding for alignment
+			}
+
+			printf(" | ");  // Separator
+
+			// Print ASCII representation
+			for (size_t j = 0; j < 16; j++) {
+				if (i + j < size) {
+					unsigned char c = p[i + j];
+					printf("%c", (c >= 32 && c <= 126) ? c : '.');  // Printable ASCII or dot
+				}
+			}
+
+			printf(" |\n");
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
+	}
+}
+
+#include <thread>
+#include <atomic>
+// Debug relay shared memory structure - must match kernel side
+#define DBG_RELAY_MAPPING_NAME L"NewWorldDbgRelay"
+#define DBG_RELAY_BUFFER_SIZE (512 * 1024)  // 512KB buffer for debug messages
+
+typedef struct _DBG_RELAY_HEADER {
+	volatile ULONG WriteOffset;    // Current write position by kernel
+	volatile ULONG ReadOffset;     // Current read position by user-mode
+	volatile ULONG EventCounter;   // Incremented when new data is available
+	volatile BOOLEAN Overflow;     // Set when buffer has overflowed
+} DBG_RELAY_HEADER, * PDBG_RELAY_HEADER;
+
+typedef struct _DBG_RELAY_MEMORY {
+	DBG_RELAY_HEADER Header;
+	char Buffer[DBG_RELAY_BUFFER_SIZE];
+} DBG_RELAY_MEMORY, * PDBG_RELAY_MEMORY;
+
+// Global flag to control debugging thread
+std::atomic<bool> g_debugThreadRunning(false);
+
+// Function to monitor debug relay and print to console
+void MonitorDebugRelay() {
+	// Open the shared memory section
+	HANDLE hMapFile = OpenFileMappingW(
+		FILE_MAP_READ | FILE_MAP_WRITE,  // Read/write access
+		FALSE,                           // Do not inherit the name
+		DBG_RELAY_MAPPING_NAME           // Mapping name
+	);
+
+	if (hMapFile == NULL) {
+		std::cerr << "Could not open debug relay mapping: " << GetLastError() << std::endl;
+		return;
+	}
+
+	// Map the view of the file
+	PDBG_RELAY_MEMORY pBuf = (PDBG_RELAY_MEMORY)MapViewOfFile(
+		hMapFile,                       // Handle to map object
+		FILE_MAP_READ | FILE_MAP_WRITE, // Read/write permission
+		0, 0,                           // FileOffsetHigh, FileOffsetLow
+		sizeof(DBG_RELAY_MEMORY)        // Number of bytes to map
+	);
+
+	if (pBuf == NULL) {
+		std::cerr << "Could not map view of debug relay: " << GetLastError() << std::endl;
+		CloseHandle(hMapFile);
+		return;
+	}
+
+	std::cout << "Debug monitor active. Messages from kernel driver will appear here." << std::endl;
+
+	ULONG lastEventCount = pBuf->Header.EventCounter;
+
+	// Set the read offset to the current write offset to only show new messages
+	pBuf->Header.ReadOffset = pBuf->Header.WriteOffset;
+
+	while (g_debugThreadRunning) {
+		// Check if there's new data by comparing event counters
+		if (pBuf->Header.EventCounter != lastEventCount) {
+			lastEventCount = pBuf->Header.EventCounter;
+
+			// Process any available data
+			while (pBuf->Header.ReadOffset != pBuf->Header.WriteOffset) {
+				// Get current position
+				ULONG readOffset = pBuf->Header.ReadOffset;
+
+				// Read until null terminator or end of buffer
+				std::string message;
+				while (readOffset != pBuf->Header.WriteOffset) {
+					char c = pBuf->Buffer[readOffset];
+					readOffset = (readOffset + 1) % DBG_RELAY_BUFFER_SIZE;
+
+					if (c == '\0') {
+						break;  // End of message
+					}
+					message += c;
+				}
+
+				// Update read offset atomically
+				pBuf->Header.ReadOffset = readOffset;
+
+				// Print the message if not empty
+				if (!message.empty()) {
+					std::cout << message;
+				}
+			}
+		}
+
+		// Sleep briefly to avoid consuming too much CPU
+		Sleep(10);
+	}
+
+	// Clean up
+	UnmapViewOfFile(pBuf);
+	CloseHandle(hMapFile);
+
+	std::cout << "Debug monitor stopped." << std::endl;
+}
+
+// Function to start the debug monitor
+void StartDebugMonitor() {
+	if (!g_debugThreadRunning.exchange(true)) {
+		std::thread monitorThread(MonitorDebugRelay);
+		monitorThread.detach();  // Let it run independently
+	}
+}
+
+// Function to stop the debug monitor
+void StopDebugMonitor() {
+	g_debugThreadRunning = false;
+	// Give it some time to clean up
+	Sleep(100);
+}
+
+int main() {
+	// ntoskrnl.exe symbols
+	LPTSTR ntoskrnlPath;
+	TCHAR g_ntoskrnlPath[MAX_PATH] = { 0 };
+	_tcscat_s(g_ntoskrnlPath, _countof(g_ntoskrnlPath), TEXT("C:\\Windows\\System32\\ntoskrnl.exe")); //ntmarta
+	ntoskrnlPath = g_ntoskrnlPath;
+	symbol_ctx* sym_ctxNtskrnl = LoadSymbolsFromImageFile(ntoskrnlPath);
+
+	if (sym_ctxNtskrnl == NULL) {
+		printf("Symbols for ntoskrnl.exe not available, download failed, aborting...\n");
+		exit(1);
+	}
+	printf("ntoskrnl pdb base addr: %llx\n", sym_ctxNtskrnl->pdb_base_addr);
+	printf("ntoskrnl pdb name: %ls\n", sym_ctxNtskrnl->pdb_name_w);
+	printf("ntoskrnl sym handle: %p\n", sym_ctxNtskrnl->sym_handle);
+
+	size_t NumSymbols = 7; // TODO Handle mapping size, currently its so few we'll stay below 1 page 4096 Bytes
+	SymbolsArrayAllocationSize = sizeof(INIT);
+	SymbolsArrayAllocationSize += NumSymbols * sizeof(SYMBOL); // TODO: Change to new Var: TotalAllocationSize
 	printf("[*] Requesting %zu Bytes of Memory\n", SymbolsArrayAllocationSize);
 	auto start = std::chrono::high_resolution_clock::now();
 
@@ -587,29 +888,146 @@ int main() {
 	}
 	totalAllocationSize += SymbolsArrayAllocationSize;
 
-	unsigned long long KeServiceDescriptorTableOffset = GetAndInsertSymbol("KeServiceDescriptorTable", sym_ctx, 0, false);
-
 	unsigned long long ntBase = GetKernelBase("ntoskrnl.exe"); // DWORD64
-	GetAndInsertSymbol("ntBase", sym_ctx, ntBase, true);
+	unsigned long long eprocUniqueProcessId = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"UniqueProcessId");
+	unsigned long long eprocActiveProcessLinks = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ActiveProcessLinks");
+	unsigned long long kprocDirectoryTableBase = GetFieldOffset(sym_ctxNtskrnl, "_KPROCESS", L"DirectoryTableBase");
+	AddInitData(ntBase, eprocUniqueProcessId, eprocActiveProcessLinks, kprocDirectoryTableBase);
 
-	unsigned long long eprocUniqueProcessId = GetFieldOffset(sym_ctx, "_EPROCESS", L"UniqueProcessId");
-	GetAndInsertSymbol("eprocUniqueProcessId", sym_ctx, eprocUniqueProcessId, true);
+	//PVOID sourceVA = malloc(4096);
+	PVOID sourceVA = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	DWORD sourcePID = GetCurrentProcessId();
 
-	unsigned long long eprocActiveProcessLinks = GetFieldOffset(sym_ctx, "_EPROCESS", L"ActiveProcessLinks");
-	GetAndInsertSymbol("eprocActiveProcessLinks", sym_ctx, eprocActiveProcessLinks, true);
+	unsigned long long KeServiceDescriptorTableOffset = GetAndInsertSymbol("KeServiceDescriptorTable", sym_ctxNtskrnl, 0, false);
+	GetAndInsertSymbol("SymbolsAddr", sym_ctxNtskrnl, (unsigned long long)sourceVA, true);
+	GetAndInsertSymbol("ntBase", sym_ctxNtskrnl, ntBase, true);
+	GetAndInsertSymbol("eprocUniqueProcessId", sym_ctxNtskrnl, eprocUniqueProcessId, true);
+	GetAndInsertSymbol("eprocActiveProcessLinks", sym_ctxNtskrnl, eprocActiveProcessLinks, true);
+	GetAndInsertSymbol("kprocDirectoryTableBase", sym_ctxNtskrnl, kprocDirectoryTableBase, true);
+	unsigned long long VADRoot = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"VadRoot");
+	unsigned long long StartingVpn1 = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"StartingVpn");
+	unsigned long long EndingVpn1 = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"EndingVpn");
+	unsigned long long Left = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"Left");
+	unsigned long long Right = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"Right");
+	GetAndInsertSymbol("VADRoot", sym_ctxNtskrnl, VADRoot, true);
+	GetAndInsertSymbol("StartingVpn", sym_ctxNtskrnl, StartingVpn1, true);
+	GetAndInsertSymbol("EndingVpn", sym_ctxNtskrnl, EndingVpn1, true);
+	GetAndInsertSymbol("Left", sym_ctxNtskrnl, Left, true);
+	GetAndInsertSymbol("Right", sym_ctxNtskrnl, Right, true);
+	unsigned long long MMVADSubsection = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"Subsection");
+	unsigned long long MMVADControlArea = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"ControlArea"); // actually at Off: 0x0 and its _CONTROL_AREA*
+	unsigned long long MMVADCAFilePointer = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"FilePointer");
+	unsigned long long FILEOBJECTFileName = GetFieldOffset(sym_ctxNtskrnl, "_FILE_OBJECT", L"FileName");
+	printf("MMVADSubsection: 0x%llx\n", MMVADSubsection);
+	printf("MMVADControlArea: 0x%llx\n", MMVADControlArea);
+	printf("MMVADCAFilePointer: 0x%llx\n", MMVADCAFilePointer);
+	printf("FILEOBJECTFileName: 0x%llx\n", FILEOBJECTFileName);
+	GetAndInsertSymbol("MMVADSubsection", sym_ctxNtskrnl, MMVADSubsection, true);
+	GetAndInsertSymbol("MMVADControlArea", sym_ctxNtskrnl, MMVADControlArea, true);
+	GetAndInsertSymbol("MMVADCAFilePointer", sym_ctxNtskrnl, MMVADCAFilePointer, true);
+	GetAndInsertSymbol("FILEOBJECTFileName", sym_ctxNtskrnl, FILEOBJECTFileName, true);
+	unsigned long long EPROCImageFileName = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ImageFileName");
+	printf("EPROCImageFileName: 0x%llx\n", EPROCImageFileName);
+	GetAndInsertSymbol("EPROCImageFileName", sym_ctxNtskrnl, EPROCImageFileName, true);
+	unsigned long long MmPfnDatabase = GetAndInsertSymbol("MmPfnDatabase", sym_ctxNtskrnl, 0, false);
+	GetAndInsertSymbol("SourceVA", sym_ctxNtskrnl, (unsigned long long)sourceVA, true);
+	GetAndInsertSymbol("SourcePID", sym_ctxNtskrnl, (DWORD)sourcePID, true);
+	printf("SourceVA: 0x%llx\n", sourceVA);
+	printf("SourcePID: %d\n", (DWORD)sourcePID);
 
-	unsigned long long kprocDirectoryTableBase = GetFieldOffset(sym_ctx, "_KPROCESS", L"DirectoryTableBase");
-	GetAndInsertSymbol("kprocDirectoryTableBase", sym_ctx, kprocDirectoryTableBase, true);
+	unsigned long long PEB = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"Peb");
+	unsigned long long PEBLdr = GetFieldOffset(sym_ctxNtskrnl, "_PEB", L"Ldr");
+	unsigned long long LdrListHead = GetFieldOffset(sym_ctxNtskrnl, "_PEB_LDR_DATA", L"InMemoryOrderModuleList");
+	unsigned long long LdrListEntry = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"InMemoryOrderLinks");
+	unsigned long long LdrBaseDllName = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"BaseDllName");
+	unsigned long long LdrBaseDllBase = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"DllBase"); 
+	unsigned long long KeInvalidateAllCaches = GetAndInsertSymbol("KeInvalidateAllCaches", sym_ctxNtskrnl, 0, false);
+	GetAndInsertSymbol("PEB", sym_ctxNtskrnl, PEB, true);
+	GetAndInsertSymbol("PEBLdr", sym_ctxNtskrnl, PEBLdr, true);
+	GetAndInsertSymbol("LdrListHead", sym_ctxNtskrnl, LdrListHead, true);
+	GetAndInsertSymbol("LdrListEntry", sym_ctxNtskrnl, LdrListEntry, true);
+	GetAndInsertSymbol("LdrBaseDllName", sym_ctxNtskrnl, LdrBaseDllName, true);
+	GetAndInsertSymbol("LdrBaseDllBase", sym_ctxNtskrnl, LdrBaseDllBase, true);
+	printf("PEB: 0x%llx\n", PEB);
+	printf("PEBLdr: 0x%llx\n", PEBLdr);
+	printf("LdrListHead: 0x%llx\n", LdrListHead);
+	printf("LdrListEntry: 0x%llx\n", LdrListEntry);
+	printf("LdrBaseDllName: 0x%llx\n", LdrBaseDllName);
+	printf("LdrBaseDllBase: 0x%llx\n", LdrBaseDllBase);
+
+	// ntmarta.dll symbols
+	UnloadSymbols(sym_ctxNtskrnl, false);
+	LPTSTR ntmartaPath;
+	TCHAR g_ntmartaPath[MAX_PATH] = { 0 };
+	_tcscat_s(g_ntmartaPath, _countof(g_ntmartaPath), TEXT("C:\\Windows\\System32\\ntmarta.dll")); //ntmarta
+	ntmartaPath = g_ntmartaPath;
+	symbol_ctx* sym_ctxNtmarta = LoadSymbolsFromImageFile(ntmartaPath);
+
+	if (sym_ctxNtmarta == NULL) {
+		printf("Symbols for ntmarta.dll not available, download failed, aborting...\n");
+		exit(1);
+	}
+	printf("marta pdb base addr: %llx\n", sym_ctxNtmarta->pdb_base_addr);
+	printf("marta pdb name: %ls\n", sym_ctxNtmarta->pdb_name_w);
+	printf("marta sym handle: %p\n", sym_ctxNtmarta->sym_handle);
+	unsigned long long TargetVA = GetSymbolOffset(sym_ctxNtmarta, "MartaSetKernelRights");
+	
+	GetAndInsertSymbol("TargetVA", sym_ctxNtmarta, TargetVA, true);
+	printf("TargetVA: 0x%llx\n", TargetVA);
 
 	printf("[*] Section available: Total Size Allocated: %d Bytes | Total Size Copied: %d Bytes\n\t[+] Waiting for driver to read...\n", totalAllocationSize, totalCopiedSize);
-	HexDump(SymbolsArray, SymbolsArrayAllocationSize);
+	HexDump((PVOID)((PINIT)SymbolsArray + sizeof(INIT)), SymbolsArrayAllocationSize);
+	//HexDump((PVOID*)sourceVA + 0x950, 10);
+	printf("\n--------\n");
 
-	int cont;
-	std::cout << "continue..";
-	std::cin >> cont;
+	int ch;
+	ch = getchar();
+
+	// Start the debug monitor in a separate thread
+	StartDebugMonitor();
+
+	// Stop the debug monitor before exiting
+	StopDebugMonitor();
+
+	DWORD oldProtect;
+	BOOLEAN vProtect = false;
+	PVOID base = 0x0;
+	while (true) {
+		ch = getchar();
+
+		if (ch == '\n')  // Skip empty Enter presses
+			continue;
+
+		if (ch == 'x' || ch == 'X')
+			break;
+
+		//__invlpg(sourceVA);
+		//VirtualProtect()
+		base = (PVOID)((unsigned long long)sourceVA & 0xfffffffffffff000);
+		CheckModifiedMemory(base, 4096);
+		//vProtect = VirtualProtect(base, 4096, PAGE_READWRITE, &oldProtect);
+		//if (!VirtualProtect) {
+		//	printf("[-] VirtualProtect failed: %d\n", GetLastError());
+		//} else {
+		//	printf("[+] VirtualProtect succeeded\n");
+		//}
+		//printf("Base: 0x%llx\n", base);
+		//HexDump((PVOID)base, 100);
+		//if (vProtect) {
+		//	if (VirtualProtect(base, 4096, oldProtect, &oldProtect)) {
+		//		printf("Restored old protection: 0x%lx\n", oldProtect);
+		//	} else {
+		//		printf("[-] Failed to restore old protection: %d\n", GetLastError());
+		//	}
+		//} else {
+		//	printf("[-] Can not restore old protection\n");
+		//}
+
+		// Flush remaining characters in the buffer until newline
+		while ((ch = getchar()) != '\n' && ch != EOF);
+	}
 
 	UnmapViewOfFile(SymbolsArray);
 	CloseHandle(hMapFile);
-
 	return 0;
 }
