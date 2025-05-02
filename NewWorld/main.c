@@ -1,101 +1,119 @@
-#include <ntifs.h>
+#include <ntifs.h> // new
+#include <intrin.h>
 #include "main.h"
+#include "FuncDefs.h"
 
+// =================================================================
+// GLOBAL DATA
+// =================================================================
+#define MAPPING_NAME L"\\BaseNamedObjects\\MySharedMemory"
 
-#define MAPPING_NAME_INPUT  L"\\BaseNamedObjects\\MySharedMemory"
-#define MAPPING_NAME_OUTPUT L"\\BaseNamedObjects\\VADSharedMemory"
-#define MAPPING_NAME_FROM_FILENAMES L"\\BaseNamedObjects\\VADSharedMemoryFileNames"
-#define MAPPING_NOTIFICATION_LINK_EVENT L"\\BaseNamedObjects\\Global\\LinkMemory"
-#define MAPPING_NOTIFICATION_Unlink_EVENT L"\\BaseNamedObjects\\Global\\UnlinkMemory"
-#define MAPPING_NOTIFICATION_INIT_EVENT L"\\BaseNamedObjects\\Global\\InitializeMemory"
-#define MAPPING_NOTIFICATION_USERMODEREADY_EVENT L"\\BaseNamedObjects\\Global\\UserModeReadEvent"
+PVOID SymbolList;
+SIZE_T SymsViewSize;
+
 PRESET_UNICODE_STRING(usDeviceName, CSTRING(DRV_DEVICE));
 PRESET_UNICODE_STRING(usSymbolicLinkName, CSTRING(DRV_LINK));
 
-PDEVICE_OBJECT gpDeviceObject = NULL;
+PDEVICE_OBJECT  gpDeviceObject = NULL;
 PDEVICE_CONTEXT gpDeviceContext = NULL;
-PEPROCESS gSourceProcess = NULL;
-PHYSICAL_ADDRESS gOrigPhys = { 0 };
-unsigned long long gOrigVal = 0x0;
-// =================================================================
-// GLOBAL VARIABLES
-// =================================================================
-SIZE_T   gViewSize = 0;
-SIZE_T   gFileNameViewSize = 0;
-SIZE_T	 gCurrFileNameOffset = 1;
-SIZE_T   gSecVADIndex = 0;
-PVOID    gSection = 0;
-PVOID    gFileNameSection = 0;
-SIZE_T   gSymsViewSize = 0;
-//PVOID    gSymbolList = 0;
-INIT     gInit = { 0 };
-SYM_INFO gSymInfo = { 0 };
-HANDLE hInSection;
-PVOID pInSection = NULL;
 
-HANDLE hEventLINK;
-HANDLE hEventUnlink;
-HANDLE hEventUSERMODEREADY;
-HANDLE hEventINIT;
+BOOL            gfSpyHookState = FALSE;
+BOOL            gfSpyHookPause = FALSE;
+BOOL            gfSpyHookFilter = FALSE;
+HANDLE          ghSpyHookThread = 0;
+
+BYTE            abHex[] = "0123456789ABCDEF";
+
+
+// =================================================================
+// SYSTEM SERVICE HOOK ENTRIES
+// =================================================================
+
+SPY_HOOK_ENTRY aSpyHooks[SDT_SYMBOLS_MAX];
+
+// -----------------------------------------------------------------
+
+NTSTATUS DriverInitialize(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pusRegistryPath);
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pusRegistryPath);
+
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(INIT, DriverInitialize)
+#pragma alloc_text(INIT, DriverEntry)
+#endif
+
+typedef struct _INIT {
+	CHAR identifier[4];
+	DWORD NtBaseOffset;
+	DWORD KPROCDirectoryTableBaseOffset;
+	DWORD EPROCActiveProcessLinksOfsset;
+	DWORD EPROCUniqueProcessIdOffset;
+} INIT, *PINIT;
+
+typedef struct _SYMBOL {
+	CHAR name[32];
+	unsigned long long offset;
+	LIST_ENTRY ListEntry;
+} SYMBOL, * PSYMBOL;
 
 
 NTSTATUS DriverInitialize(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pusRegistryPath) {
+	DWORD i;
 	PDEVICE_OBJECT pDeviceObject = NULL;
-	NTSTATUS status = STATUS_DEVICE_CONFIGURATION_ERROR;
+	NTSTATUS ns = STATUS_DEVICE_CONFIGURATION_ERROR;
 
-	if ((status = IoCreateDevice(
-		pDriverObject, DEVICE_CONTEXT_,
-		&usDeviceName, FILE_DEVICE_NW_INTERFACE,
-		0, FALSE, &pDeviceObject)) == STATUS_SUCCESS) {
-		// ---
+	if ((ns = IoCreateDevice(
+							pDriverObject, DEVICE_CONTEXT_,
+							&usDeviceName, FILE_DEVICE_SPY,
+							0, FALSE, &pDeviceObject))
+		== STATUS_SUCCESS) {
 		gpDeviceObject = pDeviceObject;
 		gpDeviceContext = pDeviceObject->DeviceExtension;
 
 		gpDeviceContext->pDriverObject = pDriverObject;
 		gpDeviceContext->pDeviceObject = pDeviceObject;
+
+		MUTEX_INITIALIZE(gpDeviceContext->kmDispatch);
+		MUTEX_INITIALIZE(gpDeviceContext->kmProtocol);
+
+		gpDeviceContext->dMisses = 0;
+
+		for (i = 0; i < SPY_CALLS; i++) {
+			gpDeviceContext->SpyCalls[i].fInUse = FALSE;
+			gpDeviceContext->SpyCalls[i].hThread = 0;
+		}
+		//SpyWriteReset(&gpDeviceContext->SpyCalls);
+	} else {
+		//IoDeleteDevice(pDeviceObject); // Can't Delete Device, If IoCreate failed...
 	}
-	else {
-		DbgPrint("[-] Failed to create device object: %08X\n", status);
-		return status;
-	}
-	DbgPrint("[+] Device object created: %d\n", status);
-	return status;
+	DbgPrint("DriverInitialize - Status: 0x%llx\n", ns);
+	return ns;
 }
 
-void DriverUnload(PDRIVER_OBJECT pDriverObject) {
-	//if (gSymbolList != NULL)
-	//	ExFreePool(gSymbolList);
-	
-	ZwClose(hEventLINK);
-	ZwClose(hEventUnlink);
-	ZwClose(hEventINIT);
-	ZwClose(hEventUSERMODEREADY);
+UINT64 GetSymOffset(const char* str) {
+	if (SymbolList == NULL)
+		return 0;  // Return 0 instead of NULL for a UINT64 return type
 
-	ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-	ZwClose(hInSection);
+	// Calculate the address after the INIT structure
+	PSYMBOL syms = (PSYMBOL)((PINIT)SymbolList + sizeof(INIT));  // Add 1 to move past the INIT structure
 
-	DbgPrint("[+] Freeing space...\n");
-	ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSection);
-	ZwClose(gpDeviceContext->hSection);
+	// Calculate maximum symbols based on remaining size
+	size_t maxSymCount = (SymsViewSize - sizeof(INIT)) / sizeof(SYMBOL);
 
-	DbgPrint("[+] Freeing space for FileName...\n");
-	ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSectionFileName);
-	ZwClose(gpDeviceContext->hSectionFileName);
+	for (size_t i = 0; i < maxSymCount; i++) {  // Use < instead of <= to avoid overflow
+		if (strcmp(syms[i].name, str) == 0) {
+			return syms[i].offset;
+		}
+	}
 
-	DbgPrint("[+] Unloading driver...\n");
-	//ObDereferenceObject(hEventUSERMODEREADY);
-	//ObDereferenceObject(hEventUnlink);
-	//ObDereferenceObject(hEventLINK);
-	IoDeleteSymbolicLink(&usSymbolicLinkName);
-	IoDeleteDevice(gpDeviceObject);
-	return;
+	return 0;  // Return 0 if symbol not found
 }
-// -----------------------------------------------------------------
+
+INIT gInit = { 0 };
 BOOL InitData() {
-	if (pInSection == NULL)
+	if (SymbolList == NULL)
 		return FALSE;
 
-	PINIT initPos = (PINIT)pInSection;
+	PINIT initPos = (PINIT)SymbolList;
 
 	// Compare as 4 separate characters or use a proper string comparison
 	if (initPos->identifier[0] == 'I' &&
@@ -103,261 +121,48 @@ BOOL InitData() {
 		initPos->identifier[2] == 'I' &&
 		initPos->identifier[3] == 'T') {
 
-		gInit = *initPos;
+		gInit = *initPos;  // Copy the structure
 		return TRUE;
 	}
 
 	return FALSE;
 }
-// -----------------------------------------------------------------
-UINT64 GetSymOffset(const char* str) {
-	if (pInSection == NULL)
-		return 0;
 
-	// Calculate the address after the INIT structure
-	PSYMBOL syms = (PSYMBOL)((PINIT)pInSection + sizeof(INIT));
-
-	// Calculate maximum symbols based on remaining size
-	size_t maxSymCount = (gSymsViewSize - sizeof(INIT)) / sizeof(SYMBOL);
-
-	for (size_t i = 0; i < maxSymCount; i++) {
-		if (strcmp(syms[i].name, str) == 0) {
-			return syms[i].offset;
+PEPROCESS GetProcess(UINT32 pid, unsigned long long eprocUniqueProcessId, unsigned long long eprocActiveProcessLinks) {
+	PVOID CurrEProc = PsGetCurrentProcess();
+	PVOID StartProc = CurrEProc;
+	PUINT32 CurrentPID = (PUINT32)((ULONG_PTR)CurrEProc + eprocUniqueProcessId);
+	PLIST_ENTRY CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
+	do {
+		if (*(UINT32*)CurrentPID == pid) {
+			PEPROCESS targetProcess = (PEPROCESS)CurrEProc;
+			DbgPrint("[+] PEPROCESS Target Process: 0x%llx\n", targetProcess);
+			return targetProcess;
 		}
-	}
-
-	return 0;
+		CurrEProc = (ULONG_PTR)CurList->Flink - eprocActiveProcessLinks;
+		CurrentPID = (PUINT32)((ULONG_PTR)CurrEProc + eprocUniqueProcessId);
+		CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
+	} while ((ULONG_PTR)StartProc != (ULONG_PTR)CurrEProc);
 }
-// -----------------------------------------------------------------
-BOOL InitSymInfo() {
-	gSymInfo.EProcUniqueProcessId = GetSymOffset("eprocUniqueProcessId");
-	gSymInfo.EProcActiveProcessLinks = GetSymOffset("eprocActiveProcessLinks");
-	gSymInfo.KPROCDirectoryTableBase = GetSymOffset("kprocDirectoryTableBase");
-	//gSymInfo.sourceVA = GetSymOffset("sourceVA");
-	//gSymInfo.targetVPN = GetSymOffset("targetVPN");
-	gSymInfo.VADRoot = GetSymOffset("VADRoot");
-	gSymInfo.StartingVpnOffset = GetSymOffset("StartingVpn");
-	gSymInfo.EndingVpnOffset = GetSymOffset("EndingVpn");
-	gSymInfo.Left = GetSymOffset("Left");
-	gSymInfo.Right = GetSymOffset("Right");
-	gSymInfo.MMVADSubsection = GetSymOffset("MMVADSubsection");
-	gSymInfo.MMVADControlArea = GetSymOffset("MMVADControlArea");
-	gSymInfo.MMVADCAFilePointer = GetSymOffset("MMVADCAFilePointer");
-	gSymInfo.FILEOBJECTFileName = GetSymOffset("FILEOBJECTFileName");
-	gSymInfo.EProcImageFileName = GetSymOffset("EPROCImageFileName");
-	gSymInfo.PEB = GetSymOffset("PEB");
-	gSymInfo.PEBLdr = GetSymOffset("PEBLdr");
-	gSymInfo.LdrListHead = GetSymOffset("LdrListHead");
-	gSymInfo.LdrListEntry = GetSymOffset("LdrListEntry");
-	gSymInfo.LdrBaseDllName = GetSymOffset("LdrBaseDllName");
-	gSymInfo.LdrBaseDllBase = GetSymOffset("LdrBaseDllBase");
-	return TRUE;
-}
-// -----------------------------------------------------------------
-BOOL InsertVADNode(int Level,
-	PVOID VADNode,
-	unsigned long long StartingVpn,
-	unsigned long long EndingVpn,
-	UNICODE_STRING* FileName) {
 
-	if (gViewSize / sizeof(VAD_NODE) <= gSecVADIndex) {
-		DbgPrint("[-] VAD node index out of bounds\n");
-		return FALSE;
-	}
-	if (gFileNameViewSize / sizeof(VAD_NODE_FILE) <= gCurrFileNameOffset) {
-		return FALSE;
-	}
-
-	PVAD_NODE CurrVADNode = (PVAD_NODE)gSection;
-	PVAD_NODE_FILE FileNameBuffer = (PVAD_NODE_FILE)gFileNameSection;
-	
-	CurrVADNode[gSecVADIndex].Level = Level;
-	CurrVADNode[gSecVADIndex].VADNode = VADNode;
-	CurrVADNode[gSecVADIndex].StartingVpn = StartingVpn;
-	CurrVADNode[gSecVADIndex].EndingVpn = EndingVpn;
-	CurrVADNode[gSecVADIndex].FileOffset = 0;
-	if (FileName != NULL && FileName->Length > 0 && FileName->Length < gViewSize) {
-		ANSI_STRING test;
-		if (NT_SUCCESS(RtlUnicodeStringToAnsiString(
-			&test,
-			FileName,
-			TRUE))) {
-			size_t size = min(test.Length, sizeof(VAD_NODE_FILE));
-			memcpy(FileNameBuffer[gCurrFileNameOffset].FileName, test.Buffer, size);
-			FileNameBuffer[gCurrFileNameOffset].FileName[min(size, MAX_FILENAME_SIZE - 1)] = '\0';
-			CurrVADNode[gSecVADIndex].FileOffset = gCurrFileNameOffset;
-			RtlFreeAnsiString(&test);
-			gCurrFileNameOffset++;
-		} else {
-			DbgPrint("[-] Failed to convert FileName to ANSI\n");
+PVOID GetDirectoryTableBase(UINT32 pid, unsigned long long eprocUniqueProcessId, unsigned long long eprocActiveProcessLinks, unsigned long long kprocDirectoryTableBase) {
+	// TODO: THIS IS SHIT CHANGE THIS!!!!!
+	PVOID CurrEProc = PsGetCurrentProcess();
+	PVOID StartProc = CurrEProc;
+	PUINT32 CurrentPID = (PUINT32)((ULONG_PTR)CurrEProc + eprocUniqueProcessId);
+	PLIST_ENTRY CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
+	do {
+		if (*(UINT32*)CurrentPID == pid) {
+			PVOID* test = (unsigned long long)CurrEProc + kprocDirectoryTableBase;
+			
+			return *test;
 		}
-	}
-
-	gSecVADIndex++;
-	return TRUE;
+		CurrEProc = (ULONG_PTR)CurList->Flink - eprocActiveProcessLinks;
+		CurrentPID = (PUINT32)((ULONG_PTR)CurrEProc + eprocUniqueProcessId);
+		CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
+	} while ((ULONG_PTR)StartProc != (ULONG_PTR)CurrEProc);
 }
-// -----------------------------------------------------------------
-UNICODE_STRING* GetFileObjectFromVADLeaf(unsigned long long Leaf, DWORD MMVADSubsection, DWORD MMVADControlArea, DWORD MMVADCAFilePointer, DWORD FILEOBJECTFileName) {
-	// Check if Leaf is NULL first
-	if (Leaf == 0) {
-		return NULL;
-	}
 
-	unsigned long long SubsectionPtr = *(PVOID*)(Leaf + MMVADSubsection);
-	// MmIsAddressValid is much faster than try-except and achieves similar safety
-	if (!MmIsAddressValid((PVOID)SubsectionPtr)) {
-		return NULL;
-	}
-
-	unsigned long long ControlArea = *(PVOID*)(SubsectionPtr);
-	if (!MmIsAddressValid((PVOID)ControlArea)) {
-		return NULL;
-	}
-
-	unsigned long long FilePointer = (PVOID*)(ControlArea + MMVADCAFilePointer);
-	if (!MmIsAddressValid((PVOID)FilePointer)) {
-		return NULL;
-	}
-
-	unsigned long long FileObject = *(PVOID*)FilePointer;
-	if (!MmIsAddressValid((PVOID)FileObject)) {
-		return NULL;
-	}
-
-	// Apply mask to FileObject
-	FileObject = FileObject - (FileObject & 0xF);
-	if (!MmIsAddressValid((PVOID)(FileObject + FILEOBJECTFileName))) {
-		return NULL;
-	}
-
-	UNICODE_STRING* FileName = (UNICODE_STRING*)(FileObject + FILEOBJECTFileName);
-	// Additional validation on the UNICODE_STRING structure
-	if (!MmIsAddressValid(FileName->Buffer)) {
-		return NULL;
-	}
-
-	return FileName;
-}
-// -----------------------------------------------------------------
-VOID WalkVADRecursive(PVOID VADNode, unsigned long StartingVpnOffset, DWORD EndingVpnOffset,
-	DWORD Left, DWORD Right, int Level,
-	PULONG TotalVADs, PULONG TotalLevels, PULONG MaxDepth,
-	DWORD MMVADSubsection, DWORD MMVADControlArea, DWORD MMVADCAFilePointer, DWORD FILEOBJECTFileName,
-	unsigned long long targetAdr) {
-	// If node is NULL, return
-	if (VADNode == NULL) {
-		return;
-	}
-	// Update statistics
-	(*TotalVADs)++;
-	(*TotalLevels) += Level;
-	if (Level > *MaxDepth) {
-		*MaxDepth = Level;
-	}
-
-	// Get node information
-	unsigned long long Vpn;
-	unsigned long long VpnStart;
-	unsigned long long VpnEnd;
-	unsigned long long VpnHigh;
-	unsigned long long VpnHighPart0;
-	unsigned long long VpnHighPart1;
-	unsigned long long StartingVpn;
-	unsigned long long EndingVpn;
-	Vpn = *(PVOID*)((unsigned long long)VADNode + StartingVpnOffset);
-	VpnStart = Vpn & 0xFFFFFFFF;
-	VpnEnd = (Vpn >> 32) & 0xFFFFFFFF;
-
-	VpnHigh = *(PVOID*)((unsigned long long)VADNode + 0x20); // StartingVpnHigh
-	VpnHighPart0 = VpnHigh & 0xFF; // Mask to get low part
-	VpnHighPart1 = (VpnHigh >> 8) & 0xFF;
-	VpnHighPart0 = VpnHighPart0 << 32;
-	VpnHighPart1 = VpnHighPart1 << 32;
-
-	StartingVpn = VpnStart | VpnHighPart0;
-	EndingVpn = VpnEnd | VpnHighPart1;
-
-	// Check if targetAdr is within the range of this VAD
-	BOOLEAN isTargetInRange = FALSE;
-
-	UNICODE_STRING* FileName = GetFileObjectFromVADLeaf(VADNode, MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName);
-
-	// Print current node with fixed width formatting
-	// Add indicator if this range contains the target address
-	//if (FileName == NULL) {
-	//	DbgPrint("%-10d 0x%p          0x%010I64x     0x%010I64x\n",
-	//		Level,
-	//		VADNode,
-	//		StartingVpn,
-	//		EndingVpn);
-	//}
-	//else {
-	//	DbgPrint("%-10d 0x%p          0x%010I64x     0x%010I64x     %wZ\n",
-	//		Level,
-	//		VADNode,
-	//		StartingVpn,
-	//		EndingVpn,
-	//		FileName);
-	//}
-	InsertVADNode(Level, VADNode, StartingVpn, EndingVpn, FileName);
-
-	// Get left and right children
-	PVOID LeftChild = *(PVOID*)((ULONG_PTR)VADNode + Left);
-	PVOID RightChild = *(PVOID*)((ULONG_PTR)VADNode + Right);
-
-	// Recursively traverse left subtree first (smaller addresses)
-	WalkVADRecursive(LeftChild, StartingVpnOffset, EndingVpnOffset, Left, Right,
-		Level + 1, TotalVADs, TotalLevels, MaxDepth,
-		MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName,
-		targetAdr);
-
-	// Recursively traverse right subtree last (larger addresses)
-	WalkVADRecursive(RightChild, StartingVpnOffset, EndingVpnOffset, Left, Right,
-		Level + 1, TotalVADs, TotalLevels, MaxDepth,
-		MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName,
-		targetAdr);
-}
-// -----------------------------------------------------------------
-VOID WalkVAD(  PEPROCESS TargetProcess,
-						  DWORD VADRootOffset,
-						  DWORD StartingVpnOffset,
-						  DWORD EndingVpnOffset,
-						  DWORD Left,
-						  DWORD Right,
-						  DWORD MMVADSubsection,
-						  DWORD MMVADControlArea,
-						  DWORD MMVADCAFilePointer,
-						  DWORD FILEOBJECTFileName,
-						  unsigned long long targetAdr  ) {
-
-	PVOID* pVADRoot = (PVOID*)((ULONG_PTR)TargetProcess + VADRootOffset);
-	if (!MmIsAddressValid(*pVADRoot)) {
-		DbgPrint("[-] VAD tree is empty | *pVADRoot: 0x%llx -> TargetProcess: 0x%llx + VADRootOffset: 0x%lx\n", *pVADRoot, TargetProcess, VADRootOffset);
-		return;
-	}
-
-	// Print header with consistent column widths
-	//DbgPrint("\nLevel      VADNode                StartingVpn        EndingVpn          FileName\n");
-	//DbgPrint("-----      -------                -----------        ---------          --------\n");
-
-	// Variables to track statistics
-	ULONG totalVADs = 0;
-	ULONG totalLevels = 0;
-	ULONG maxDepth = 0;
-	gSecVADIndex = 0;
-
-	// Call recursive function with statistics tracking - passing the targetAdr
-	WalkVADRecursive(*pVADRoot, StartingVpnOffset, EndingVpnOffset, Left, Right, 1,
-		&totalVADs, &totalLevels, &maxDepth, MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName,
-		targetAdr);
-
-	// Calculate and print statistics
-	//ULONG avgLevel = (totalVADs > 0) ? totalLevels / totalVADs : 0;
-	//ULONG avgLevelFrac = (totalVADs > 0) ? ((totalLevels * 100) / totalVADs) % 100 : 0;
-	//DbgPrint("Total VADs: %lu, average level: %lu.%02lu, maximum depth: %lu\n\n",
-	//	totalVADs, avgLevel, avgLevelFrac, maxDepth);
-}
-// -----------------------------------------------------------------
 PEPROCESS GetProcessByName(
 	const char* FileName,
 	unsigned long long eprocImageFileNameOffset,
@@ -366,7 +171,7 @@ PEPROCESS GetProcessByName(
 	PVOID StartProc = CurrEProc;
 	PLIST_ENTRY CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
 	PCHAR CurrentImageName = (PCHAR)((ULONG_PTR)CurrEProc + eprocImageFileNameOffset);
-	size_t FileNameSize = (strlen(FileName) > 15) ? 14 : strlen(FileName); // 14 cause of null terminator
+	size_t FileNameSize = (strlen(FileName) > 15) ? 15 : strlen(FileName);
 	do {
 		if (!MmIsAddressValid(CurrEProc)) {
 			DbgPrint("[-] Invalid EPROCESS address: 0x%llx\n", CurrEProc);
@@ -380,8 +185,8 @@ PEPROCESS GetProcessByName(
 	} while ((ULONG_PTR)StartProc != (ULONG_PTR)CurrEProc);
 	return 0x0;
 }
-// -----------------------------------------------------------------
-unsigned long long GetDirectoryTableBaseByName(
+
+PVOID GetDirectoryTableBaseByName(
 	const char* FileName,
 	unsigned long long eprocImageFileNameOffset,
 	unsigned long long eprocActiveProcessLinks,
@@ -390,17 +195,16 @@ unsigned long long GetDirectoryTableBaseByName(
 	PVOID StartProc = CurrEProc;
 	PLIST_ENTRY CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
 	PCHAR CurrentImageName = (PCHAR)((ULONG_PTR)CurrEProc + eprocImageFileNameOffset);
-	size_t FileNameSize = (strlen(FileName) > 14) ? 14 : strlen(FileName);
+	size_t FileNameSize = (strlen(FileName) > 15) ? 15 : strlen(FileName);
 	do {
-		//DbgPrint("[*] GetDirectoryTableBaseByName: CurrentProcess: 0x%llx | FileName: %s\n", CurrEProc, CurrentImageName);
 		if (!MmIsAddressValid(CurrEProc)) {
 			DbgPrint("[-] Invalid EPROCESS address: 0x%llx\n", CurrEProc);
 			return 0x0;
 		}
 		if (memcmp(FileName, CurrentImageName, FileNameSize) == 0) {
 			PVOID* test = (unsigned long long)CurrEProc + kprocDirectoryTableBase;
-			//DbgPrint("[*] GetDirectoryTableBaseByName: Found Process: 0x%llx | DirectoryTableBase: 0x%llx\n", CurrEProc, *test);
 			return *test;
+			//return (PVOID*)((unsigned long long)CurrEProc + kprocDirectoryTableBase);
 		}
 		CurrEProc = (ULONG_PTR)CurList->Flink - eprocActiveProcessLinks;
 		CurrentImageName = (PCHAR)((ULONG_PTR)CurrEProc + eprocImageFileNameOffset);
@@ -408,16 +212,12 @@ unsigned long long GetDirectoryTableBaseByName(
 	} while ((ULONG_PTR)StartProc != (ULONG_PTR)CurrEProc);
 	return 0x0;
 }
-// -----------------------------------------------------------------
+
+PHYSICAL_ADDRESS OrigPhys = { 0 };
+unsigned long long OrigVal = 0x0;
 VOID ChangeRef(
 	unsigned long long SourceVA, PEPROCESS SourceProcess, unsigned long long SourceCR3,
 	unsigned long long TargetVA, PEPROCESS TargetProcess, unsigned long long TargetCR3) {
-	if (SourceVA == 0x0 || TargetVA == 0x0) {
-		DbgPrint("[-] ChangeRef: SourceVA or TargetVA is NULL\n");
-		return;
-	}
-	DbgPrint("[*] ChangeRef: SourceVA: 0x%llx | SourceProcess: 0x%llx | SourceCR3: 0x%llx\n", SourceVA, SourceProcess, SourceCR3);
-	DbgPrint("[*] ChangeRef: TargetVA: 0x%llx | TargetProcess: 0x%llx | TargetCR3: 0x%llx\n", TargetVA, TargetProcess, TargetCR3);
 
 	unsigned long long TargetPFN = 0x0;
 	KAPC_STATE ApcState;
@@ -455,8 +255,8 @@ VOID ChangeRef(
 	DbgPrint("Get for Target\n");
 	// Extract the PFN
 	KeStackAttachProcess(TargetProcess, &ApcState);
-	MDL* pMdlTarget = IoAllocateMdl(TargetVA, 4096, FALSE, FALSE, NULL);
-	MmProbeAndLockPages(pMdlTarget, UserMode, IoReadAccess);
+	//MDL* pMdlTarget = IoAllocateMdl(TargetVA, sizeof(TargetVA), FALSE, FALSE, NULL);
+	//MmProbeAndLockPages(pMdlTarget, UserMode, IoWriteAccess);
 
 	PML4Offset = (TargetVA & 0xFF8000000000) >> 0x27; // Page Map Level 4 Offset
 	PDPTOffset = (TargetVA & 0x7FC0000000) >> 0x1E;   // Page Directory Pointer Table Offset
@@ -484,17 +284,17 @@ VOID ChangeRef(
 		PDERaw = (PDE*)&pde;
 		pde = pde & 0xFFFFFFFFFFFF; // Mask out the upper bits
 		PDERaw = (PDE*)&pde;
+		DbgPrint("Got PT-Base: 0x%llx\n", TargetPFN);
 		if (PDERaw->PageSize == 0) {
 			// 1 = Maps a 2 MB page, 0 = Points to a page table.
 			PhysPage.PhysicalAddress.QuadPart = (pde & 0xFFFFF000) + (PTOffset * 0x08);
-			Phys.PhysicalAddress.QuadPart = PhysPage.PhysicalAddress.QuadPart + MaskOffset;
 			status = MmCopyMemory(&pte, PhysPage, sizeof(pte), MM_COPY_MEMORY_PHYSICAL, &numRec);
 			TargetPFN = pte;
-			DbgPrint("Got PT-Base: 0x%llx\n", TargetPFN);
 			pte = pte & 0xFFFFFFFFFFFF; // Mask out the upper bits
-			DbgPrint("Target PTE: 0x%llx\n", pte);
+			//TargetPFN = pde >> 0xC; // Get the PFN
 			PTERaw = (PTE*)&pte;
 			PHYSRaw4KB = (PHYSICAL_4KB*)&pte;
+			//TargetPFN = PHYSRaw4KB->Value;
 		}
 		else {
 			PHYSRaw2MB = (PHYSICAL_2MB*)&pde;
@@ -503,20 +303,21 @@ VOID ChangeRef(
 	else {
 		PHYSRaw1GB = (PHYSICAL_1GB*)&pdpte;
 	}
-	MmUnlockPages(pMdlTarget);
-	IoFreeMdl(pMdlTarget);
+	//MmUnlockPages(pMdlTarget);
+	//IoFreeMdl(pMdlTarget);
 	KeUnstackDetachProcess(&ApcState);
 
 	// Source Process
 	DbgPrint("Get for Source\n");
 	KeStackAttachProcess(SourceProcess, &ApcState);
-	MDL* pMdlSource = IoAllocateMdl(SourceVA, 4096, FALSE, FALSE, NULL);
-	MmProbeAndLockPages(pMdlSource, UserMode, IoReadAccess);
+	//MDL* pMdlSource = IoAllocateMdl(SourceVA, sizeof(SourceVA), FALSE, FALSE, NULL);
+	//MmProbeAndLockPages(pMdlSource, UserMode, IoReadAccess);
 
 	PML4Offset = (SourceVA & 0xFF8000000000) >> 0x27; // Page Map Level 4 Offset
 	PDPTOffset = (SourceVA & 0x7FC0000000) >> 0x1E;   // Page Directory Pointer Table Offset
 	PDOffset = (SourceVA & 0x3FE00000) >> 0x15;       // Page Directory Offset
 	PTOffset = (SourceVA & 0x1FF000) >> 0x0C;         // Page Table Offset
+	//MaskOffset = (SourceVA & 0x1FFFFF);               // Physical Offset
 	MaskOffset = (SourceVA & 0xFFF);               // Physical Offset
 
 	// walk PML4 -> Physical
@@ -541,14 +342,19 @@ VOID ChangeRef(
 		if (PDERaw->PageSize == 0) {
 			// 1 = Maps a 2 MB page, 0 = Points to a page table.
 			PhysPage.PhysicalAddress.QuadPart = (pde & 0xFFFFF000) + (PTOffset * 0x08);
+			//status = MmCopyMemory(&pte, PhysPage, sizeof(pte), MM_COPY_MEMORY_PHYSICAL, &numRec);
+			//pte = pte & 0xFFFFFFFFFFFF; // Mask out the upper bits
+
+			// Todo Why cant I do Copy Memory twice on the same Physical???
 			Phys.PhysicalAddress.QuadPart = PhysPage.PhysicalAddress.QuadPart + MaskOffset;
 			status = MmCopyMemory(&physAdr, Phys, sizeof(physAdr), MM_COPY_MEMORY_PHYSICAL, &numRec);
-			gOrigPhys.QuadPart = Phys.PhysicalAddress.QuadPart;
-			gOrigVal = physAdr;
+			OrigPhys.QuadPart = Phys.PhysicalAddress.QuadPart;
+			OrigVal = physAdr;
 			physAdr = physAdr & 0xFFFFFFFFFFFF; // Mask out the upper bits
-			DbgPrint("Source PTE: 0x%llx\n", physAdr);
 			PTERaw = (PTE*)&physAdr;
 			PHYSRaw4KB = (PHYSICAL_4KB*)&physAdr;
+			//PTERaw = (PTE*)&pte;
+			//PHYSRaw4KB = (PHYSICAL_4KB*)&pte;
 		}
 		else {
 			PHYSRaw2MB = (PHYSICAL_2MB*)&pde;
@@ -565,24 +371,29 @@ VOID ChangeRef(
 		PTE* temp = MmGetVirtualForPhysical(Phys.PhysicalAddress);
 		DbgPrint("VirtualForPhysical at: 0x%llx\n", temp);
 		DbgPrint("Changing PFN to TargetPFN: 0x%llx - 0x%llx\n", temp->Value, TargetPFN);
+		// preserve the upper original bytes, since we have them masked out in TargetPFN and we dont want to overwrite with 0's
+		//PVOID* temp2 = (PVOID*)((unsigned long long)temp - 0x4);
+		//DbgPrint("temp2 is: 0x%llx\n", temp2);
+		//DbgPrint("temp2 has: 0x%llx\n", *temp2);
+		//PVOID* temp3 = (unsigned long long)*temp2 >> 0xC;
+		//DbgPrint("PFN is: 0x%llx\n", temp3);
+		//DbgPrint("TargetPFN: 0x%llx\n", TargetPFN);
 		memcpy(temp, &TargetPFN, sizeof(TargetPFN)); // the size should be correct
 		DbgPrint("CHANGED\n");
 		__invlpg(SourceVA);
-		MmUnlockPages(pMdlSource);
-		IoFreeMdl(pMdlSource);
 		KeUnstackDetachProcess(&ApcState);
 		return;
+		//KeUnstackDetachProcess(&ApcState);
+		//VirtToPhys(SourceVA, SourceProcess, SourceCR3, TRUE);
 	}
 	else {
 		DbgPrint("[-] PTERaw is NULL\n");
-		MmUnlockPages(pMdlSource);
-		IoFreeMdl(pMdlSource);
 		KeUnstackDetachProcess(&ApcState);
 	}
 	DbgPrint("Returning\n");
 	return;
 }
-// -----------------------------------------------------------------
+
 VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long long cr3, BOOLEAN log) {
 	KAPC_STATE ApcState;
 	NTSTATUS status;
@@ -609,8 +420,8 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 
 	PML4E* PML4ERaw = 0x0; // Page Map Level 4 Entry
 	PDPTE* PDPTERaw = 0x0; // Page Directory Pointer Table Entry
-	PDE* PDERaw = 0x0; // Page Directory Entry
-	PTE* PTERaw = 0x0; // Page Table Entry
+	PDE* PDERaw		= 0x0; // Page Directory Entry
+	PTE* PTERaw		= 0x0; // Page Table Entry
 	PHYSICAL_1GB* PHYSRaw1GB = 0x0; // Huge Page
 	PHYSICAL_2MB* PHYSRaw2MB = 0x0; // Large Page
 	PHYSICAL_4KB* PHYSRaw4KB = 0x0; // Page
@@ -760,16 +571,14 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 					"\t[*] PageNumber: %llx\n"
 					"\t[*] Value: %llx\n",
 					PHYSRaw4KB->Offset, PHYSRaw4KB->PageNumber, PHYSRaw4KB->Value);
-			}
-			else {
+			} else {
 				DbgPrint("[+] PHYS 2MB-\n"
 					"\t[*] Offset: %llx\n"
 					"\t[*] PageNumber: %llx\n"
 					"\t[*] Value: %llx\n",
 					PHYSRaw2MB->Offset, PHYSRaw2MB->PageNumber, PHYSRaw2MB->Value);
 			}
-		}
-		else {
+		} else {
 			DbgPrint("[+] PHYS 1GB-\n"
 				"\t[*] Offset: %llx\n"
 				"\t[*] PageNumber: %llx\n"
@@ -780,461 +589,464 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 	KeUnstackDetachProcess(&ApcState);
 	return;
 }
-// -----------------------------------------------------------------
-BOOL g_StopRequested = FALSE;
-VOID WorkerThread(PVOID Context) {
-	PKEVENT pEvent = (PKEVENT)Context;
-	while (!g_StopRequested) {
-		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
-		if (NT_SUCCESS(status)) {
-			DbgPrint("[+] Event signaled\n");
-		}
-		else {
-			DbgPrint("[-] WorkerThread Failed to wait for event: %08X\n", status);
-		}
-		g_StopRequested = TRUE;
-		pEvent->Header.SignalState = 0; // Reset the event
+
+UNICODE_STRING* GetFileObjectFromVADLeaf(unsigned long long Leaf, DWORD MMVADSubsection, DWORD MMVADControlArea, DWORD MMVADCAFilePointer, DWORD FILEOBJECTFileName) {
+	// Check if Leaf is NULL first
+	if (Leaf == 0) {
+		return NULL;
 	}
-	PsTerminateSystemThread(STATUS_SUCCESS);
-}
-VOID LinkWorkerThread(PVOID Context) {
-	PKEVENT pEvent = (PKEVENT)Context;
-	while (!g_StopRequested) {
-		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
-		if (!NT_SUCCESS(status)) {
-			DbgPrint("[-] LinkWorkerThread Failed to wait for event: %08X\n", status);
-			break;
-		}
-		gSourceProcess = GetProcessByName(gInit.sourceProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
-		PEPROCESS pTargetProcess = GetProcessByName(gInit.targetProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
-		unsigned long long targetCR3 = GetDirectoryTableBaseByName(gInit.targetProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks, gSymInfo.KPROCDirectoryTableBase);
-		unsigned long long sourceCR3 = GetDirectoryTableBaseByName(gInit.sourceProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks, gSymInfo.KPROCDirectoryTableBase);
-		if (gInit.targetVPN != 0x0) {
-			PVOID targetVA = gInit.targetVPN * 0x1000;
-			VirtToPhys(gInit.sourceVA, gSourceProcess, sourceCR3, TRUE);
-			//VirtToPhys(targetVA, pTargetProcess, targetCR3, TRUE);
-			ChangeRef(gInit.sourceVA, gSourceProcess, sourceCR3, targetVA, pTargetProcess, targetCR3);
-		}
-		pEvent->Header.SignalState = 0; // Reset the event
+
+	unsigned long long SubsectionPtr = *(PVOID*)(Leaf + MMVADSubsection);
+	// MmIsAddressValid is much faster than try-except and achieves similar safety
+	if (!MmIsAddressValid((PVOID)SubsectionPtr)) {
+		return NULL;
 	}
-	PsTerminateSystemThread(STATUS_SUCCESS);
+
+	unsigned long long ControlArea = *(PVOID*)(SubsectionPtr);
+	if (!MmIsAddressValid((PVOID)ControlArea)) {
+		return NULL;
+	}
+
+	unsigned long long FilePointer = (PVOID*)(ControlArea + MMVADCAFilePointer);
+	if (!MmIsAddressValid((PVOID)FilePointer)) {
+		return NULL;
+	}
+
+	unsigned long long FileObject = *(PVOID*)FilePointer;
+	if (!MmIsAddressValid((PVOID)FileObject)) {
+		return NULL;
+	}
+
+	// Apply mask to FileObject
+	FileObject = FileObject - (FileObject & 0xF);
+	if (!MmIsAddressValid((PVOID)(FileObject + FILEOBJECTFileName))) {
+		return NULL;
+	}
+
+	UNICODE_STRING* FileName = (UNICODE_STRING*)(FileObject + FILEOBJECTFileName);
+	// Additional validation on the UNICODE_STRING structure
+	if (!MmIsAddressValid(FileName->Buffer)) {
+		return NULL;
+	}
+
+	return FileName;
 }
-VOID UnlinkWorkerThread(PVOID Context) {
-	PKEVENT pEvent = (PKEVENT)Context;
-	while (!g_StopRequested) {
-		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
-		if (!NT_SUCCESS(status)) {
-			DbgPrint("[-] UnlinkWorkerThread, Failed to wait for event: %08X\n", status);
-			break;
+
+ULONG GetRandomAddress(ULONG Start, ULONG End) {
+	LARGE_INTEGER perfCounter;
+	KeQueryPerformanceCounter(&perfCounter);
+	ULONG Seed = (ULONG)perfCounter.LowPart;
+	ULONG RandomAddress = Start + (RtlRandomEx(&Seed) % (End - Start + 1));
+	RandomAddress &= ~0x3; // Ensure the address is aligned to a 4-byte boundary
+	return RandomAddress;
+}
+unsigned long long RandAddr = 0x0;
+VOID WalkVADRecursive(PVOID VADNode, unsigned long StartingVpnOffset, DWORD EndingVpnOffset,
+	DWORD Left, DWORD Right, int Level,
+	PULONG TotalVADs, PULONG TotalLevels, PULONG MaxDepth,
+	DWORD MMVADSubsection, DWORD MMVADControlArea, DWORD MMVADCAFilePointer, DWORD FILEOBJECTFileName,
+	unsigned long long targetAdr) {
+	// If node is NULL, return
+	if (VADNode == NULL) {
+		return;
+	}
+	// Update statistics
+	(*TotalVADs)++;
+	(*TotalLevels) += Level;
+	if (Level > *MaxDepth) {
+		*MaxDepth = Level;
+	}
+
+	// Get node information
+	unsigned long long Vpn;
+	unsigned long long VpnStart;
+	unsigned long long VpnEnd;
+	unsigned long long VpnHigh;
+	unsigned long long VpnHighPart0;
+	unsigned long long VpnHighPart1;
+	unsigned long long StartingVpn;
+	unsigned long long EndingVpn;
+	Vpn = *(PVOID*)((unsigned long long)VADNode + StartingVpnOffset);
+	VpnStart = Vpn & 0xFFFFFFFF;
+	VpnEnd = (Vpn >> 32) & 0xFFFFFFFF;
+
+	VpnHigh = *(PVOID*)((unsigned long long)VADNode + 0x20); // StartingVpnHigh
+	VpnHighPart0 = VpnHigh & 0xFF; // Mask to get low part
+	VpnHighPart1 = (VpnHigh >> 8) & 0xFF;
+	VpnHighPart0 = VpnHighPart0 << 32;
+	VpnHighPart1 = VpnHighPart1 << 32;
+
+	StartingVpn = VpnStart | VpnHighPart0;
+	EndingVpn = VpnEnd | VpnHighPart1;
+
+	// Check if targetAdr is within the range of this VAD
+	BOOLEAN isTargetInRange = FALSE;
+	//if (targetAdr != 0) {
+	//	// Convert the address to a VPN (Virtual Page Number) for comparison
+	//	// A page is typically 4KB (0x1000), so shift right by 12 bits
+	//	unsigned long long targetVpn = targetAdr >> 12;
+	//	isTargetInRange = (targetVpn >= StartingVpn && targetVpn <= EndingVpn);
+	//}
+
+	UNICODE_STRING* FileName = GetFileObjectFromVADLeaf(VADNode, MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName);
+
+	// Print current node with fixed width formatting
+	// Add indicator if this range contains the target address
+	if (FileName == NULL) {
+		DbgPrint("%-10d 0x%p          0x%010I64x     0x%010I64x     %s\n",
+			Level,
+			VADNode,
+			StartingVpn,
+			EndingVpn,
+			isTargetInRange ? "** CONTAINS TARGET **" : "");
+	}
+	else {
+		DbgPrint("%-10d 0x%p          0x%010I64x     0x%010I64x     %wZ     %s\n",
+			Level,
+			VADNode,
+			StartingVpn,
+			EndingVpn,
+			FileName,
+			isTargetInRange ? "** CONTAINS TARGET **" : "");
+		//if (_wcsicmp(FileName->Buffer, L"\\Windows\\System32\\ntmarta.dll") == 0) {
+		if (_wcsicmp(FileName->Buffer, L"\\Windows\\System32\\notepad.exe") == 0) {
+			//RandAddr = GetRandomAddress(StartingVpn->LowPart, EndingVpn->LowPart);
+			RandAddr = StartingVpn * 0x1000;
+			DbgPrint("Random Address at fixed point: 0x%llx\n", RandAddr);
 		}
-		if (gOrigVal != 0x0 && gOrigPhys.QuadPart != 0x0 && gSourceProcess != NULL) {
-			PKAPC_STATE ApcState;
-			DbgPrint("gSourceProcess: 0x%llx\n", gSourceProcess);
-			KeStackAttachProcess(gSourceProcess, &ApcState);
-			PVOID* temp = MmGetVirtualForPhysical(gOrigPhys);
-			memcpy(temp, &gOrigVal, sizeof(gOrigVal));
-			unsigned long long curVal = *temp;
-			if (curVal != 0x0) {
-				if (curVal == gOrigVal) {
-					DbgPrint("[+] Successfully restored all modified PTEs to their original values\n");
+	}
+
+	//if (*TotalVADs == 55) {
+	//	RandAddr = GetRandomAddress(StartingVpn->LowPart, EndingVpn->LowPart);
+	//	RandAddr = StartingVpn->LowPart;
+	//	DbgPrint("Random Address at fixed point: 0x%lx\n", RandAddr);
+	//}
+
+	// Get left and right children
+	PVOID LeftChild = *(PVOID*)((ULONG_PTR)VADNode + Left);
+	PVOID RightChild = *(PVOID*)((ULONG_PTR)VADNode + Right);
+
+	// Recursively traverse left subtree first (smaller addresses)
+	WalkVADRecursive(LeftChild, StartingVpnOffset, EndingVpnOffset, Left, Right,
+		Level + 1, TotalVADs, TotalLevels, MaxDepth,
+		MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName,
+		targetAdr);
+
+	// Recursively traverse right subtree last (larger addresses)
+	WalkVADRecursive(RightChild, StartingVpnOffset, EndingVpnOffset, Left, Right,
+		Level + 1, TotalVADs, TotalLevels, MaxDepth,
+		MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName,
+		targetAdr);
+}
+
+unsigned long long WalkLoadedModulesInTargetProcess(
+	unsigned long long pTargetEProcess, WCHAR* pTargetName, DWORD PEBOffset, DWORD PEBLdrOffset,
+	DWORD LdrListHeadOffset, DWORD InLoadOrderModuleListOffset,
+	DWORD LdrBaseDllNameOffset, DWORD LdrBaseDllBaseOffset) {
+	KAPC_STATE ApcState;
+	unsigned long long PEB = *(PVOID*)(pTargetEProcess + PEBOffset);
+	KeStackAttachProcess(pTargetEProcess, &ApcState);
+	//D3COLD_AUX_POWER_AND_TIMING_INTERFACE* PEBLdr = PEB + PEBLdrOffset; // what is this?
+	unsigned long long PEBLdr = *(PVOID*)(PEB + PEBLdrOffset);
+	LIST_ENTRY* LdrListHead = (PEBLdr + LdrListHeadOffset) - 0x10;
+	LIST_ENTRY* pCurrentEntry = LdrListHead;
+	LIST_ENTRY* pNextEntry = LdrListHead->Flink;
+	unsigned long long ret = 0x0;
+	do {
+		unsigned long long LdrEntry = (unsigned long long)pCurrentEntry - InLoadOrderModuleListOffset;
+		unsigned long long BaseDllName = LdrEntry + LdrBaseDllNameOffset;
+		UNICODE_STRING* pBaseDllName = (UNICODE_STRING*)BaseDllName;
+		// Actual format of pBaseDllName->Buffer is: "C:\Windows\SYSTEM32\name.dll"
+		// Find the last backslash to get just the filename
+		for (int i = (pBaseDllName->Length / sizeof(WCHAR)) - 1; i >= 0; i--) {
+			if (pBaseDllName->Buffer[i] == L'\\') {
+				UNICODE_STRING truncatedName;
+				truncatedName.Buffer = &pBaseDllName->Buffer[i+1];
+				truncatedName.Length = pBaseDllName->Length - ((i+1) * sizeof(WCHAR));
+				truncatedName.MaximumLength = pBaseDllName->MaximumLength;
+				//if (_wcsicmp(truncatedName.Buffer, L"ntmarta.dll") == 0) {
+				DbgPrint("TruncatedName: %wZ\n", &truncatedName);
+				if (_wcsicmp(truncatedName.Buffer, L"notepad.exe") == 0) {
+				//if (_wcsicmp(truncatedName.Buffer, pTargetName) == 0) {
+					DbgPrint("Target: %wZ found\n", truncatedName.Buffer);
+					DbgPrint("LDR_DATA_TABLE_ENTRY: 0x%llx\n", LdrEntry);
+					DbgPrint("DllBase: 0x%llx\n", LdrEntry + LdrBaseDllBaseOffset);
+					ret = *(PVOID*)(LdrEntry + LdrBaseDllBaseOffset);
+					KeUnstackDetachProcess(&ApcState);
+					return ret;
 				}
-				else {
-					DbgPrint("[-] Failed to restore modified PTEs\n");
-				}
+				break;
 			}
-			else {
-				DbgPrint("[-] MmGetVirtualForPhysical has no content\n");
-			}
-			KeUnstackDetachProcess(&ApcState);
 		}
-		else {
-			DbgPrint("[-] No modified PTEs to restore\n");
-		}
-		pEvent->Header.SignalState = 0; // Reset the event
-	}
-	PsTerminateSystemThread(STATUS_SUCCESS);
+		pNextEntry = (LIST_ENTRY*)pCurrentEntry->Flink;
+		pCurrentEntry = pNextEntry;
+	} while (pCurrentEntry != (LIST_ENTRY*)LdrListHead);
+	KeUnstackDetachProcess(&ApcState);
+	return;
 }
-VOID UserModeReadWorkerThread(PVOID Context) {
-	PKEVENT pEvent = (PKEVENT)Context;
-	while (!g_StopRequested) {
-		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL); // TODO: perhaps change to WaitForMultipleObjects
-		if (!NT_SUCCESS(status)) {
-			DbgPrint("[-] UserModeReadWorkerThread Failed to wait for event: %08X\n", status);
-			break;
-		}
-		// Make sure section is not getting paged-out | VAD Node Info - Memory Section
-		DbgPrint("[+] Allocating MDL for section\n");
-		gpDeviceContext->pMdl = IoAllocateMdl(gSection, gViewSize, FALSE, FALSE, NULL);
-		DbgPrint("[+] Probing and locking pages\n");
-		MmProbeAndLockPages(gpDeviceContext->pMdl, KernelMode, IoReadAccess);
-		// Make sure section is not getting paged-out | VAD Node FileName Info - Memory Section
-		DbgPrint("[+] Allocating MDL for section for FileName\n");
-		gpDeviceContext->pFileNameMdl = IoAllocateMdl(gFileNameSection, gFileNameViewSize, FALSE, FALSE, NULL);
-		DbgPrint("[+] Probing and locking pages for FileName\n");
-		MmProbeAndLockPages(gpDeviceContext->pFileNameMdl, KernelMode, IoReadAccess);
 
-		DbgPrint("[+] Source Process: %s\n", gInit.sourceProcess);
-		DbgPrint("[+] Target Process: %s\n", gInit.targetProcess);
-		gSourceProcess = GetProcessByName(gInit.sourceProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
-		PEPROCESS pTargetProcess = GetProcessByName(gInit.targetProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
-
-		RtlZeroMemory(gFileNameSection, gFileNameViewSize);
-		if (pTargetProcess != NULL) {
-			WalkVAD(pTargetProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
-				gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
-				gSymInfo.MMVADCAFilePointer, gSymInfo.FILEOBJECTFileName, 0x0);
-		}
-
-		MmUnlockPages(gpDeviceContext->pMdl);
-		IoFreeMdl(gpDeviceContext->pMdl);
-
-		MmUnlockPages(gpDeviceContext->pFileNameMdl);
-		IoFreeMdl(gpDeviceContext->pFileNameMdl);
-		pEvent->Header.SignalState = 0; // Reset the event
+VOID WalkVAD(PEPROCESS TargetProcess, DWORD VADRootOffset, DWORD StartingVpnOffset, DWORD EndingVpnOffset, DWORD Left, DWORD Right,
+	DWORD MMVADSubsection, DWORD MMVADControlArea, DWORD MMVADCAFilePointer, DWORD FILEOBJECTFileName, unsigned long long targetAdr) {
+	// Get the VAD root from the process
+	PVOID* pVADRoot = (PVOID*)((ULONG_PTR)TargetProcess + VADRootOffset);
+	if (!MmIsAddressValid(*pVADRoot)) {
+		DbgPrint("[-] VAD tree is empty | *pVADRoot: 0x%llx -> TargetProcess: 0x%llx + VADRootOffset: 0x%lx\n", *pVADRoot, TargetProcess, VADRootOffset);
+		return;
 	}
-	PsTerminateSystemThread(STATUS_SUCCESS);
+
+	// Print header with consistent column widths
+	DbgPrint("\nLevel      VADNode                StartingVpn        EndingVpn          FileName\n");
+	DbgPrint("-----      -------                -----------        ---------          --------\n");
+
+	// Variables to track statistics
+	ULONG totalVADs = 0;
+	ULONG totalLevels = 0;
+	ULONG maxDepth = 0;
+
+	// Call recursive function with statistics tracking - passing the targetAdr
+	WalkVADRecursive(*pVADRoot, StartingVpnOffset, EndingVpnOffset, Left, Right, 1,
+		&totalVADs, &totalLevels, &maxDepth, MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName,
+		targetAdr);
+
+	// Calculate and print statistics
+	ULONG avgLevel = (totalVADs > 0) ? totalLevels / totalVADs : 0;
+	ULONG avgLevelFrac = (totalVADs > 0) ? ((totalLevels * 100) / totalVADs) % 100 : 0;
+	DbgPrint("Total VADs: %lu, average level: %lu.%02lu, maximum depth: %lu\n\n",
+		totalVADs, avgLevel, avgLevelFrac, maxDepth);
 }
-VOID INITWorkerThread(PVOID Context) {
-	PKEVENT pEvent = (PKEVENT)Context;
-	int test;
-	while (!g_StopRequested) {
-		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL); // TODO: perhaps change to WaitForMultipleObjects
-		if (!NT_SUCCESS(status)) {
-			DbgPrint("[-] UserModeReadWorkerThread Failed to wait for event: %08X\n", status);
-			break;
-		}
-		if (pInSection == NULL) {
-			//RtlZeroMemory(pInSection, gSymsViewSize);
-			status = ZwMapViewOfSection(hInSection, ZwCurrentProcess(), &pInSection,
-				0, 0, NULL, &gSymsViewSize, ViewShare,
-				0, PAGE_READONLY);
-			if (!NT_SUCCESS(status)) {
-				DbgPrint("[-] Failed to map view of input section: %08X\n", status);
-				ZwClose(hInSection);
-				IoDeleteSymbolicLink(&usSymbolicLinkName);
-				IoDeleteDevice(gpDeviceObject);
-				return status;
-			}
-			DbgPrint("[+] Initializing Sym Info\n");
-			if (!InitSymInfo()) {
-				DbgPrint("[-] Failed to initialize symbol information\n");
-				//ExFreePool(gSymbolList);
-				//IoDeleteSymbolicLink(&usSymbolicLinkName);
-				//IoDeleteDevice(gpDeviceObject);
-				return STATUS_UNSUCCESSFUL;
-			}
-		}
-		DbgPrint("[+] Initializing INIT Data %llx\n", status);
-		if (!InitData()) {
-			DbgPrint("[-] Failed to initialize data\n");
-			//ExFreePool(gSymbolList);
-			//IoDeleteSymbolicLink(&usSymbolicLinkName);
-			//IoDeleteDevice(gpDeviceObject);
-			return STATUS_UNSUCCESSFUL;
-		}
-		DbgPrint("[+] Finished initializing data and symbol information\n");
-		pEvent->Header.SignalState = 0; // Reset the event
 
+PEPROCESS globalSourceProcess = NULL;
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pusRegistryPath) {
+	PDRIVER_DISPATCH* ppdd;
+	//NTSTATUS ns = STATUS_DEVICE_CONFIGURATION_ERROR;
+	NTSTATUS ns = STATUS_SUCCESS; // TODO
 
-		//// Make sure section is not getting paged-out
-		//MDL* pInMdl = IoAllocateMdl(pInSection, gSymsViewSize, FALSE, FALSE, NULL);
-		//MmProbeAndLockPages(pInMdl, KernelMode, IoReadAccess);
-		//
-		//// Allocate enough space for INPUT section' content
-		//gSymbolList = ExAllocatePool(NonPagedPool, gSymsViewSize);
-		//if (!(gSymbolList == NULL)) {
-		//	memcpy(gSymbolList, pInSection, gSymsViewSize);
-		//	DbgPrint("[*] Section size: %zu Bytes | Section Base: 0x%llx | SymbolList Base: 0x%llx\n",
-		//		gSymsViewSize, pInSection, gSymbolList);
-		//}
-		//else {
-		//	DbgPrint("[-] Failed to allocate memory for input section: %llx\n", status);
-		//	MmUnlockPages(pInMdl);
-		//	IoFreeMdl(pInMdl);
-		//	ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-		//	ZwClose(hInSection);
-		//	IoDeleteSymbolicLink(&usSymbolicLinkName);
-		//	IoDeleteDevice(gpDeviceObject);
-		//	return status;
-		//}
-		//DbgPrint("[+] Input section mapped successfully: %llx\n", status);
-		//MmUnlockPages(pInMdl);
-		//IoFreeMdl(pInMdl);
-		////ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-		////ZwClose(hInSection);
-		//
-		//DbgPrint("[+] Initializing INIT Data %llx\n", status);
-		//if (!InitData()) {
-		//	DbgPrint("[-] Failed to initialize data\n");
-		//	ExFreePool(gSymbolList);
-		//	IoDeleteSymbolicLink(&usSymbolicLinkName);
-		//	IoDeleteDevice(gpDeviceObject);
-		//	return STATUS_UNSUCCESSFUL;
-		//}
-		//DbgPrint("[+] Initializing Sym Info\n");
-		//if (!InitSymInfo()) {
-		//	DbgPrint("[-] Failed to initialize symbol information\n");
-		//	ExFreePool(gSymbolList);
-		//	IoDeleteSymbolicLink(&usSymbolicLinkName);
-		//	IoDeleteDevice(gpDeviceObject);
-		//	return STATUS_UNSUCCESSFUL;
-		//}
-		//DbgPrint("[+] Finished initializing data and symbol information\n");
-		//pEvent->Header.SignalState = 0; // Reset the event
-	}
-	PsTerminateSystemThread(STATUS_SUCCESS);
-}
-NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
-					   PUNICODE_STRING pusRegistryPath  ) {
+	if ((ns = DriverInitialize(pDriverObject, pusRegistryPath)) == STATUS_SUCCESS) {
+		ppdd = pDriverObject->MajorFunction;
 
-	NTSTATUS status = STATUS_DEVICE_CONFIGURATION_ERROR;
-
-	if ((status = DriverInitialize(pDriverObject, pusRegistryPath)) == STATUS_SUCCESS) {
+		//ppdd[IRP_MJ_CREATE] =
+		//	ppdd[IRP_MJ_CREATE_NAMED_PIPE] =
+		//	ppdd[IRP_MJ_CLOSE] =
+		//	ppdd[IRP_MJ_READ] =
+		//	ppdd[IRP_MJ_WRITE] =
+		//	ppdd[IRP_MJ_QUERY_INFORMATION] =
+		//	ppdd[IRP_MJ_SET_INFORMATION] =
+		//	ppdd[IRP_MJ_QUERY_EA] =
+		//	ppdd[IRP_MJ_SET_EA] =
+		//	ppdd[IRP_MJ_FLUSH_BUFFERS] =
+		//	ppdd[IRP_MJ_QUERY_VOLUME_INFORMATION] =
+		//	ppdd[IRP_MJ_SET_VOLUME_INFORMATION] =
+		//	ppdd[IRP_MJ_DIRECTORY_CONTROL] =
+		//	ppdd[IRP_MJ_FILE_SYSTEM_CONTROL] =
+		//	ppdd[IRP_MJ_DEVICE_CONTROL] =
+		//	ppdd[IRP_MJ_INTERNAL_DEVICE_CONTROL] =
+		//	ppdd[IRP_MJ_SHUTDOWN] =
+		//	ppdd[IRP_MJ_LOCK_CONTROL] =
+		//	ppdd[IRP_MJ_CLEANUP] =
+		//	ppdd[IRP_MJ_CREATE_MAILSLOT] =
+		//	ppdd[IRP_MJ_QUERY_SECURITY] =
+		//	ppdd[IRP_MJ_SET_SECURITY] =
+		//	ppdd[IRP_MJ_POWER] =
+		//	ppdd[IRP_MJ_SYSTEM_CONTROL] =
+		//	ppdd[IRP_MJ_DEVICE_CHANGE] =
+		//	ppdd[IRP_MJ_QUERY_QUOTA] =
+		//	ppdd[IRP_MJ_SET_QUOTA] =
+		//	ppdd[IRP_MJ_PNP] = DriverDispatcher;
 		pDriverObject->DriverUnload = DriverUnload;
-		gpDeviceContext->gSectionMapped = FALSE;
 
-		// START - Section for Input
-		OBJECT_ATTRIBUTES InAttr;
-		UNICODE_STRING InSectionName;
-		PVOID InSectionObject = NULL;
-		LARGE_INTEGER InSecSize;
-		InSecSize.QuadPart = 0x2000;
-
-		SECURITY_DESCRIPTOR sdInSecurityDescriptor;
-		ACL sdInAcl;
-		RtlCreateSecurityDescriptor(&sdInSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION);
-		RtlSetDaclSecurityDescriptor(&sdInSecurityDescriptor, TRUE, NULL, FALSE);
-		RtlInitUnicodeString(&InSectionName, MAPPING_NAME_INPUT);
-		InitializeObjectAttributes(&InAttr, &InSectionName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdInSecurityDescriptor);
-		
-		//status = ZwOpenSection(&hInSection, SECTION_MAP_READ, &InAttr); // TODO: I think this can stay User-Mode
-		status = ZwCreateSection(&hInSection, SECTION_ALL_ACCESS | SECTION_MAP_WRITE,
-			&InAttr, &InSecSize, PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL); // why can we not specify maximum sizeLow but only maximum sizeHigh????
-		// Restarting the user-mode application our buffer will still be buffered
-		// But this requires the kernel driver to start after the SYMBOLS habe been writte to the
-		// section. Otherwise the driver will not be able to read the symbols.
-		if (!NT_SUCCESS(status) || hInSection == NULL) {
-			DbgPrint("[-] Failed to create input section: %08X\n", status);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
-		}
-
-		gSymsViewSize = 0;
-		LARGE_INTEGER InSectionOffset = { 0 };
-
-		// END - Section for Input
-		// -----------------------------------------------------------------
-		// Section for Info from Driver
-		// START - Section for Output
+	// ================================================
+	// READ SECTION FROM USER-MODE (SYMBOL-INFORMATION)
+	// ================================================
+		HANDLE hSection;
 		OBJECT_ATTRIBUTES attr;
 		UNICODE_STRING sectionName;
 		PVOID sectionObject = NULL;
-		LARGE_INTEGER sectionSize;
-		sectionSize.QuadPart = 0x3000; // or whatever size you want, 4KB in this case
-		SECURITY_DESCRIPTOR sdSecurityDescriptor;
-		ACL sdAcl;
-		RtlCreateSecurityDescriptor(&sdSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION);
-		RtlSetDaclSecurityDescriptor(&sdSecurityDescriptor, TRUE, NULL, FALSE);
 
-		DbgPrint("[+] Initializing Section Name\n");
-		RtlInitUnicodeString(&sectionName, MAPPING_NAME_OUTPUT);
-		InitializeObjectAttributes(&attr, &sectionName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
+		RtlInitUnicodeString(&sectionName, MAPPING_NAME);
+		InitializeObjectAttributes(&attr, &sectionName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
-		DbgPrint("[+] Creating section for output\n");
-		//status = ZwOpenSection(&gpDeviceContext->hSection, SECTION_ALL_ACCESS | SECTION_MAP_WRITE, &attr);
-		status = ZwCreateSection(&gpDeviceContext->hSection, SECTION_ALL_ACCESS | SECTION_MAP_WRITE,
-			&attr, &sectionSize, PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL); // why can we not specify maximum sizeLow but only maximum sizeHigh????
-		if (!NT_SUCCESS(status) || gpDeviceContext->hSection == NULL) {
-			DbgPrint("[-] Failed to open section: %llx\n", status);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
+		NTSTATUS status = ZwOpenSection(&hSection, SECTION_MAP_READ | SECTION_MAP_WRITE, &attr);
+		if (!NT_SUCCESS(status) || hSection == NULL) {
+			DbgPrint("[-] ZwOpenSection failed - Status: %d\n", status);
 			return status;
 		}
 
-		gViewSize = 0;
-		LARGE_INTEGER SectionOffset = { 0 };
+		SymsViewSize = 0; // 0 means "use full section size"
+		LARGE_INTEGER SectionOffset = { 0 }; // Map from start
 
-		DbgPrint("[+] Mapping view of section\n");
-		status = ZwMapViewOfSection(gpDeviceContext->hSection, ZwCurrentProcess(), &gSection,
-			0, 0, NULL, &gViewSize, ViewShare,
+		PVOID vSection = 0;
+		status = ZwMapViewOfSection(hSection, ZwCurrentProcess(), &vSection, 
+			0, 0, NULL, &SymsViewSize, ViewUnmap,
 			0, PAGE_READWRITE);
 		if (!NT_SUCCESS(status)) {
-			DbgPrint("[-] Failed to map view of section: %llx\n", status);
-			ZwClose(gpDeviceContext->hSection);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
-		}
-		DbgPrint("[+] Section size: %zu Bytes | Section Base: 0x%llx\n",
-			gViewSize, gSection);
-
-		// Make sure section is not getting paged-out
-		//DbgPrint("[+] Allocating MDL for section\n");
-		//gpDeviceContext->pMdl = IoAllocateMdl(gSection, gViewSize, FALSE, FALSE, NULL);
-		//DbgPrint("[+] Probing and locking pages\n");
-		//MmProbeAndLockPages(gpDeviceContext->pMdl, KernelMode, IoReadAccess);
-
-		gpDeviceContext->gSectionMapped = TRUE;
-		// -----------------------------------------------------------------
-		// Section for FileName-Info from Driver
-		OBJECT_ATTRIBUTES attrFileName;
-		UNICODE_STRING sectionFileName;
-		PVOID sectionFileNameObject = NULL;
-		LARGE_INTEGER sectionSizeFILENAMES;
-		sectionSizeFILENAMES.QuadPart = 0x2000; // or whatever size you want, 4KB in this case
-
-		DbgPrint("[+] Initializing Section Name for FileName\n");
-		RtlInitUnicodeString(&sectionFileName, MAPPING_NAME_FROM_FILENAMES);
-		InitializeObjectAttributes(&attrFileName, &sectionFileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-
-		//status = ZwOpenSection(&gpDeviceContext->hSectionFileName, SECTION_ALL_ACCESS | SECTION_MAP_WRITE, &attrFileName);
-		status = ZwCreateSection(&gpDeviceContext->hSectionFileName, SECTION_ALL_ACCESS | SECTION_MAP_WRITE,
-			&attrFileName, &sectionSizeFILENAMES, PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL); // why can we not specify maximum sizeLow but only maximum sizeHigh????
-		if (!NT_SUCCESS(status) || gpDeviceContext->hSectionFileName == NULL) {
-			DbgPrint("[-] Failed to open section for FileName: %llx\n", status);
-			ZwClose(gpDeviceContext->hSection);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
+			DbgPrint("[-] ZwMapViewOfSection failed - status: %d\n", status);
 			return status;
 		}
 
-		gFileNameViewSize = 0;
-		LARGE_INTEGER SectionFileNameOffset = { 0 };
+		// Make sure the Section is not paged-out
+		MDL* pMdl = IoAllocateMdl(vSection, SymsViewSize, FALSE, FALSE, NULL);
+		MmProbeAndLockPages(pMdl, KernelMode, IoReadAccess);
 
-		DbgPrint("[+] Mapping view of section for FileName\n");
-		status = ZwMapViewOfSection(gpDeviceContext->hSectionFileName, ZwCurrentProcess(), &gFileNameSection,
-			0, 0, NULL, &gFileNameViewSize, ViewUnmap,
-			0, PAGE_READWRITE);
-		if (!NT_SUCCESS(status)) {
-			DbgPrint("[-] Failed to map view of section for FileName: %llx\n", status);
-			ZwClose(gpDeviceContext->hSection);
-			ZwClose(gpDeviceContext->hSectionFileName);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
+		// Allocate enough space to copy section' content
+		SymbolList = ExAllocatePool(NonPagedPool, SymsViewSize);
+		if (!(SymbolList == NULL)) {
+			memcpy(SymbolList, vSection, SymsViewSize);
+			DbgPrint("[*] Section size: %zu Bytes | Section Base: 0x%llx | SymbolList Base: 0x%llx\n",
+				SymsViewSize, vSection, SymbolList);
+		} else {
+			DbgPrint("[-] Could not copy section to pool\n");
+			DbgPrint("\tSection Base: 0x%llx\n", hSection);
 		}
-		DbgPrint("[+] Section size for FileName: %zu Bytes | Section Base: 0x%llx\n",
-			gFileNameViewSize, gFileNameSection);
 
-		// Make sure section is not getting paged-out
-		//DbgPrint("[+] Allocating MDL for section for FileName\n");
-		//gpDeviceContext->pFileNameMdl = IoAllocateMdl(gFileNameSection, gFileNameViewSize, FALSE, FALSE, NULL);
-		//DbgPrint("[+] Probing and locking pages for FileName\n");
-		//MmProbeAndLockPages(gpDeviceContext->pFileNameMdl, KernelMode, IoReadAccess);
+		MmUnlockPages(pMdl);
+		IoFreeMdl(pMdl);
+		ZwUnmapViewOfSection(ZwCurrentProcess(), hSection);
+		ZwClose(hSection);
 
-		gpDeviceContext->gFileNameSectionMapped = TRUE;
-		// -----------------------------------------------------------------
-		// MAPPING_NOTIFICATION_USERMODEREADY_EVENT START
-		UNICODE_STRING eventNameUSERMODEREADY;
-		OBJECT_ATTRIBUTES objAttrUSERMODEREADY;
-		HANDLE hThreadUSERMODEREADY;
-		PKEVENT pEventUSERMODEREADY;
-		RtlInitUnicodeString(&eventNameUSERMODEREADY, MAPPING_NOTIFICATION_USERMODEREADY_EVENT);
-		InitializeObjectAttributes(&objAttrUSERMODEREADY, &eventNameUSERMODEREADY, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		//status = ZwOpenEvent(&hEventUSERMODEREADY, EVENT_ALL_ACCESS, &objAttrUSERMODEREADY);
-		status = ZwCreateEvent(&hEventUSERMODEREADY, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUSERMODEREADY, NotificationEvent, FALSE);
-		if (NT_SUCCESS(status)) {
-			DbgPrint("[+] Opened event handle: %llx\n", hEventUSERMODEREADY);
-			ObReferenceObjectByHandle(hEventUSERMODEREADY, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventUSERMODEREADY, NULL);
-			PsCreateSystemThread(&hThreadUSERMODEREADY, THREAD_ALL_ACCESS, NULL, NULL, NULL, UserModeReadWorkerThread, pEventUSERMODEREADY);
+		if (!InitData()) {
+			DbgPrint("[-] Initialization failed!\n");
+			return STATUS_SUCCESS;
 		}
-		else {
-			DbgPrint("[-] Failed to open event handle: %08X\n", status);
-			ZwClose(gpDeviceContext->hSection);
-			ZwClose(gpDeviceContext->hSectionFileName);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
+
+		// TODO: Use RTL_HASHTABLE instead
+		unsigned long long sourceVA = GetSymOffset("SourceVA");
+		DWORD sourcePID = GetSymOffset("SourcePID");
+		unsigned long long mmPfnDatabase = GetSymOffset("MmPfnDatabase");
+		unsigned long long eprocUniqueProcessId = GetSymOffset("eprocUniqueProcessId");
+		unsigned long long eprocActiveProcessLinks = GetSymOffset("eprocActiveProcessLinks");
+		unsigned long long kprocDirectoryTableBase = GetSymOffset("kprocDirectoryTableBase");
+		unsigned long long KeServiceDescriptorTableOffset = GetSymOffset("KeServiceDescriptorTable");
+		unsigned long long ntBase = GetSymOffset("ntBase");
+		unsigned long long KeServiceDescriptorTable = ntBase + KeServiceDescriptorTableOffset;
+		unsigned long long adr = GetSymOffset("SymbolsAddr");
+		DWORD pid = GetSymOffset("PID");
+
+		DWORD VADRootOffset = GetSymOffset("VADRoot");
+		DWORD StartingVpnOffset = GetSymOffset("StartingVpn");
+		DWORD EndingVpnOffset = GetSymOffset("EndingVpn");
+		DWORD Left = GetSymOffset("Left");
+		DWORD Right = GetSymOffset("Right");
+
+		DWORD MMVADSubsectionOffset = GetSymOffset("MMVADSubsection");
+		DWORD MMVADControlAreaOffset = GetSymOffset("MMVADControlArea");
+		DWORD MMVADCAFilePointerOffset = GetSymOffset("MMVADCAFilePointer");
+		DWORD FILEOBJECTFileNameOffset = GetSymOffset("FILEOBJECTFileName");
+
+		DWORD EPROCImageFileNameOffset = GetSymOffset("EPROCImageFileName");
+
+		DbgPrint("[+] sourceVA at: 0x%llx\n", sourceVA);
+		DbgPrint("[+] sourcePID at: %d\n", sourcePID);
+
+		PHYSICAL_ADDRESS phys =  MmGetPhysicalAddress(KeServiceDescriptorTable);
+		DbgPrint("[+] Physical: QuadPart: 0x%llx | HighPart: 0x%llx | LowPart: 0x%llx | u_HighPart: 0x%llx | u_LowPart: 0x%llx\n",
+			phys.QuadPart, phys.HighPart, phys.LowPart, phys.u.HighPart, phys.u.LowPart);
+
+		unsigned long long sourceCR3 = GetDirectoryTableBase(sourcePID, eprocUniqueProcessId, eprocActiveProcessLinks, kprocDirectoryTableBase);
+		PEPROCESS pSourceEProcess = GetProcess(sourcePID, eprocUniqueProcessId, eprocActiveProcessLinks);
+
+		DbgPrint("[+] sourcePID: %d | sourceCR3 at: 0x%llx\n", sourcePID, sourceCR3);
+
+		unsigned long long targetCR3 = GetDirectoryTableBaseByName("notepad", EPROCImageFileNameOffset, eprocActiveProcessLinks, kprocDirectoryTableBase);
+		PEPROCESS pTargetEProcess = GetProcessByName("notepad", EPROCImageFileNameOffset, eprocActiveProcessLinks);
+		DbgPrint("[+] pTargetEProcess at: 0x%llx | targetCR3 at: 0x%llx\n", pTargetEProcess, targetCR3);
+		DWORD PEB = GetSymOffset("PEB");
+		DWORD PEBLdr = GetSymOffset("PEBLdr");
+		DWORD LdrListHead = GetSymOffset("LdrListHead");
+		DWORD LdrListEntry = GetSymOffset("LdrListEntry");
+		DWORD LdrBaseDllName = GetSymOffset("LdrBaseDllName");
+		DWORD LdrBaseDllBase = GetSymOffset("LdrBaseDllBase");
+		DbgPrint("[+] PEB at: 0x%lx | PEBLdr at: 0x%lx | LdrListHead at: 0x%lx | LdrListEntry at: 0x%lx | LdrBaseDllName at: 0x%lx\n",
+			PEB, PEBLdr, LdrListHead, LdrListEntry, LdrBaseDllName);
+		DWORD TargetVAOffset = GetSymOffset("TargetVA");
+		WCHAR TargetName = L"ntmarta.dll";
+		// Actually now the base address
+		// Instead of this we retrieve the base address from VAD-Tree -> StartingVPN * 0x1000
+		// We can get the base-address my attaching to the process and then .reload /user and then ? notepad
+		//unsigned long long TargetVAMarta = WalkLoadedModulesInTargetProcess(pTargetEProcess, &TargetName, PEB, PEBLdr, LdrListHead, LdrListEntry, LdrBaseDllName, LdrBaseDllBase);
+		unsigned long long TargetVAMarta = 0x0;
+
+		WalkVAD(pTargetEProcess, VADRootOffset, StartingVpnOffset, EndingVpnOffset,
+			Left, Right, MMVADSubsectionOffset, MMVADControlAreaOffset, MMVADCAFilePointerOffset,
+			FILEOBJECTFileNameOffset, TargetVAMarta);
+		TargetVAMarta = RandAddr;
+		if (TargetVAMarta == 0x0) {
+			DbgPrint("[-] Could not find target process\n");
+			return STATUS_SUCCESS;
 		}
-		// MAPPING_NOTIFICATION_USERMODEREADY_EVENT END
-		// -----------------------------------------------------------------
-		// MAPPING_NOTIFICATION_Unlink_EVENT START
-		UNICODE_STRING eventNameUnlink;
-		OBJECT_ATTRIBUTES objAttrUnlink;
-		HANDLE hThreadUnlink;
-		PKEVENT pEventUnlink;
-		RtlInitUnicodeString(&eventNameUnlink, MAPPING_NOTIFICATION_Unlink_EVENT);
-		InitializeObjectAttributes(&objAttrUnlink, &eventNameUnlink, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		//status = ZwOpenEvent(&hEventUnlink, EVENT_ALL_ACCESS, &objAttrUnlink);
-		status = ZwCreateEvent(&hEventUnlink, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUnlink, NotificationEvent, FALSE);
-		if (NT_SUCCESS(status)) {
-			DbgPrint("[+] Opened event handle: %llx\n", hEventUnlink);
-			ObReferenceObjectByHandle(hEventUnlink, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventUnlink, NULL);
-			PsCreateSystemThread(&hThreadUnlink, THREAD_ALL_ACCESS, NULL, NULL, NULL, UnlinkWorkerThread, pEventUnlink);
+		DbgPrint("[+] StealingFromBase: 0x%llx\n", TargetVAMarta);
+
+		if (sourceCR3 == 0x0 || pSourceEProcess == NULL || targetCR3 == 0x0 || pTargetEProcess == NULL) {
+			DbgPrint("[-] Could not find source or target process\n");
+			return STATUS_SUCCESS;
 		}
-		else {
-			DbgPrint("[-] Failed to open event handle: %08X\n", status);
-			ObDereferenceObject(hEventUSERMODEREADY);
-			ZwClose(gpDeviceContext->hSection);
-			ZwClose(gpDeviceContext->hSectionFileName);
-			ZwClose(hEventUSERMODEREADY);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
-		}
-		// MAPPING_NOTIFICATION_Unlink_EVENT END
-		// -----------------------------------------------------------------
-		// MAPPING_NOTIFICATION_LINK_EVENT START
-		UNICODE_STRING eventNameLINK;
-		OBJECT_ATTRIBUTES objAttrLINK;
-		HANDLE hThreadLINK;
-		PKEVENT pEventLINK;
-		RtlInitUnicodeString(&eventNameLINK, MAPPING_NOTIFICATION_LINK_EVENT);
-		InitializeObjectAttributes(&objAttrLINK, &eventNameLINK, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		//status = ZwOpenEvent(&hEventLINK, EVENT_ALL_ACCESS, &objAttrLINK);
-		status = ZwCreateEvent(&hEventLINK, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrLINK, NotificationEvent, FALSE);
-		if (NT_SUCCESS(status)) {
-			DbgPrint("[+] Opened event handle: %llx\n", hEventLINK);
-			ObReferenceObjectByHandle(hEventLINK, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventLINK, NULL);
-			PsCreateSystemThread(&hThreadLINK, THREAD_ALL_ACCESS, NULL, NULL, NULL, LinkWorkerThread, pEventLINK);
-		}
-		else {
-			DbgPrint("[-] Failed to open event handle: %08X\n", status);
-			ObDereferenceObject(hEventUSERMODEREADY);
-			ObDereferenceObject(hEventUnlink);
-			ZwClose(gpDeviceContext->hSection);
-			ZwClose(gpDeviceContext->hSectionFileName); 
-			ZwClose(hEventUSERMODEREADY);
-			ZwClose(hEventUnlink);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
-		}
-		// MAPPING_NOTIFICATION_LINK_EVENT END
-		// -----------------------------------------------------------------
-		// MAPPING_NOTIFICATION_INIT_EVENT START
-		UNICODE_STRING eventNameINIT;
-		OBJECT_ATTRIBUTES objAttrINIT;
-		HANDLE hThreadINIT;
-		PKEVENT pEventINIT;
-		RtlInitUnicodeString(&eventNameINIT, MAPPING_NOTIFICATION_INIT_EVENT);
-		InitializeObjectAttributes(&objAttrINIT, &eventNameINIT, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		status = ZwCreateEvent(&hEventINIT, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrINIT, NotificationEvent, FALSE);
-		if (NT_SUCCESS(status)) {
-			DbgPrint("[+] Opened event handle: %llx\n", hEventINIT);
-			ObReferenceObjectByHandle(hEventINIT, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventINIT, NULL);
-			PsCreateSystemThread(&hThreadINIT, THREAD_ALL_ACCESS, NULL, NULL, NULL, INITWorkerThread, pEventINIT);
-		}
-		else {
-			DbgPrint("[-] Failed to open event handle: %08X\n", status);
-			ObDereferenceObject(hEventUSERMODEREADY);
-			ZwClose(gpDeviceContext->hSection);
-			ZwClose(gpDeviceContext->hSectionFileName);
-			ZwClose(hEventUSERMODEREADY);
-			IoDeleteSymbolicLink(&usSymbolicLinkName);
-			IoDeleteDevice(gpDeviceObject);
-			return status;
-		}
-		// MAPPING_NOTIFICATION_INIT_EVENT END
-		// -----------------------------------------------------------------
+
+		unsigned long long result = ((unsigned long long)RandAddr << 16) | TargetVAOffset;
+		int cpuInfo[4] = { 0 };
+		__cpuid(cpuInfo, 0x80000008);  // Get address width info
+		int physicalAddressBits = cpuInfo[0] & 0xFF;  // Bits 7:0 contain PA width
+		DbgPrint("Current M (Maximum Physical Address Width): %d\n", physicalAddressBits);
+
+		WalkVAD(pSourceEProcess, VADRootOffset, StartingVpnOffset, EndingVpnOffset,
+			Left, Right, MMVADSubsectionOffset, MMVADControlAreaOffset, MMVADCAFilePointerOffset,
+			FILEOBJECTFileNameOffset, sourceVA);
+		VirtToPhys(sourceVA, pSourceEProcess, sourceCR3, TRUE);
+		globalSourceProcess = pSourceEProcess;
+		ChangeRef(sourceVA, pSourceEProcess, sourceCR3, TargetVAMarta, pTargetEProcess, targetCR3);
+		//BOOLEAN TLBClear = KeInvalidateAllCaches();
+		//DbgPrint("[+] TLB cleared: %d\n", TLBClear);
+
+		// Restore all modified PTEs back to their original values
+		// The TRUE parameter indicates that you want to flush the entire TLB after restoration
+		//status = RestoreModifiedPTEs(TRUE);
 		status = STATUS_SUCCESS;
-		return status;
-		// END - Section for Output
-	} else {
-		DbgPrint("[-] Failed to initialize driver: %llx\n", status);
-		IoDeleteSymbolicLink(&usSymbolicLinkName);
-		IoDeleteDevice(gpDeviceObject);
-		return status;
+	//TODO: SpyDispatcher();
+	//TODO: SpyHookInitialize();
 	}
+	return ns;
+}
+
+// =================================================================
+// DRIVER REQUEST HANDLER
+// =================================================================
+
+//NTSTATUS DriverDispatcher(PDEVICE_OBJECT pDeviceObject, PIRP pIrp) {
+//	return(pDeviceObject == gpDeviceObject
+//		? DeviceDispatcher(gpDeviceContext, pIrp)
+//		: STATUS_INVALID_PARAMETER);
+//}
+
+// -----------------------------------------------------------------
+
+void DriverUnload(PDRIVER_OBJECT pDriverObject) {
+	//SpyHookCleanup();
+
+	if (OrigVal != 0x0 && OrigPhys.QuadPart != 0x0 && globalSourceProcess != NULL) {
+		PKAPC_STATE ApcState;
+		KeStackAttachProcess(globalSourceProcess, &ApcState);
+		PVOID* temp = MmGetVirtualForPhysical(OrigPhys);
+		memcpy(temp, &OrigVal, sizeof(OrigVal));
+		unsigned long long curVal = *temp;
+		if (curVal != 0x0) {
+			if (curVal == OrigVal) {
+				DbgPrint("[+] Successfully restored all modified PTEs to their original values\n");
+			}
+			else {
+				DbgPrint("[-] Failed to restore modified PTEs\n");
+			}
+		}
+		else {
+			DbgPrint("[-] MmGetVirtualForPhysical has no content\n");
+		}
+		KeUnstackDetachProcess(&ApcState);
+	}
+	else {
+		DbgPrint("[-] No modified PTEs to restore\n");
+	}
+
+	if (SymbolList != NULL)
+		ExFreePool(SymbolList);
+
+	IoDeleteSymbolicLink(&usSymbolicLinkName);
+	IoDeleteDevice(gpDeviceObject);
+	return;
 }
